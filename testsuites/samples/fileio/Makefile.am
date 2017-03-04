@@ -9,9 +9,13 @@ include $(top_srcdir)/../automake/leaf.am
 
 
 AM_CPPFLAGS += -I$(top_srcdir)/../support/include
+AM_CPPFLAGS += -I/home/vivek/sandbox/rtems-libbsd/rtemsbsd/include
+AM_CPPFLAGS += -I/home/vivek/sandbox/rtems-libbsd/freebsd/include
+AM_CPPFLAGS += -I/home/vivek/sandbox/rtems-libbsd/freebsd/sys
 
 LINK_OBJS = $(fileio_OBJECTS)
 LINK_LIBS = $(fileio_LDLIBS)
+LINK_LIBS += /home/vivek/sandbox/rtems-libbsd/build/arm-rtems4.12-xilinx_zynq_a9_qemu/libbsd.a -lm
 
 fileio$(EXEEXT): $(fileio_OBJECTS) $(fileio_DEPENDENCIES)
 	@rm -f fileio$(EXEEXT)
