@@ -185,15 +185,38 @@ rtems_capture_print_timestamp (uint64_t uptime)
              hours, minutes, seconds, nanosecs);
 }
 
-void
+uint32_t
 rtems_capture_print_record_task (int                              cpu,
                                  const rtems_capture_record*      rec,
-                                 const rtems_capture_task_record* task_rec)
+                                 const rtems_capture_task_record* task_rec,
+				 char* buf,
+				 char format)
 {
+  char *name = "TASK_RECORD"; 
+  uint32_t* in32 = (uint32_t*) buf;
+  uint32_t in = 0;
+
+  //CTF event header for record_task event
+  if (format == 'c')
+  {
+    *in32++ = (uint32_t) 0; //event_id
+    in += 1;
+  }
+
   fprintf(stdout,"%2i ", cpu);
   rtems_capture_print_timestamp (rec->time);
   fprintf (stdout, "              ");
   rtems_monitor_dump_id (rec->task_id);
+
+  if (format == 'c')
+  {
+    *in32++ = (uint32_t) cpu;
+    *in32++ = (uint32_t) (rec->time >> 32);
+    *in32++ = (uint32_t) rec->time;
+    *in32++ = (uint32_t) rec->task_id;
+    in += 4;
+  }
+
   if (rtems_object_id_get_api(rec->task_id) != OBJECTS_POSIX_API)
   {
     fprintf (stdout, " %c%c%c%c",
@@ -201,10 +224,20 @@ rtems_capture_print_record_task (int                              cpu,
              (char) (task_rec->name >> 16) & 0xff,
              (char) (task_rec->name >> 8) & 0xff,
              (char) (task_rec->name >> 0) & 0xff);
+    if (format == 'c') 
+    {
+      *in32++ = task_rec->name;
+      in += 1;
+    }
   }
   else
   {
     fprintf (stdout, " ____");
+    if (format == 'c')
+    {
+      *in32++ = -1;
+      in += 1;
+    }
   }
   fprintf(stdout, " %3" PRId32 " %3" PRId32 " ",
              (rec->events >> RTEMS_CAPTURE_REAL_PRIORITY_EVENT) & 0xff,
@@ -212,26 +245,58 @@ rtems_capture_print_record_task (int                              cpu,
    fprintf (stdout, "%3" PRId32   " %6" PRId32 "  TASK_RECORD\n",
             task_rec->start_priority,
             task_rec->stack_size);
+
+  if (format == 'c') 
+  {
+    *in32++ = (rec->events >> RTEMS_CAPTURE_REAL_PRIORITY_EVENT) & 0xff;
+    *in32++ = (rec->events >> RTEMS_CAPTURE_CURR_PRIORITY_EVENT) & 0xff;
+    *in32++ = task_rec->start_priority;
+    *in32++ = task_rec->stack_size;
+    *in32 = (uint32_t) 0; //id for task_record
+    in += 5;
+  }
 }
 
-void
+uint32_t
 rtems_capture_print_record_capture(int                         cpu,
                                    const rtems_capture_record* rec,
                                    uint64_t                    diff,
-                                   const rtems_name*           name)
+                                   const rtems_name*           name,
+				   char*		       buf,
+				   char			       format)
 {
   uint32_t event;
   int      e;
 
   event = rec->events >> RTEMS_CAPTURE_EVENT_START;
+  uint32_t* in32 = (uint32_t*) buf;
+  uint32_t in = 0;
+
   for (e = RTEMS_CAPTURE_EVENT_START; e < RTEMS_CAPTURE_EVENT_END; e++)
   {
     if (event & 1)
     {
+      //CTF event header for record_capture event
+      if (format == 'c')
+      {
+        *in32++ = (uint32_t) 1; //event_id
+        in += 1;
+      }
+
       fprintf(stdout,"%2i ", cpu);
       rtems_capture_print_timestamp (rec->time);
       fprintf (stdout, " %12" PRId32 " ", (uint32_t) diff);
       rtems_monitor_dump_id (rec->task_id);
+      if (format == 'c')
+      {
+        *in32++ = (uint32_t) cpu;
+        *in32++ = (uint32_t) (rec->time >> 32);
+        *in32++ = (uint32_t) rec->time;
+        *in32++ = (uint32_t) diff;
+        *in32++ = (uint32_t) rec->task_id;
+        in += 5;
+      }
+
       if (name != NULL)
       {
         fprintf (stdout, " %c%c%c%c",
@@ -248,9 +313,17 @@ rtems_capture_print_record_capture(int                         cpu,
              (rec->events >> RTEMS_CAPTURE_REAL_PRIORITY_EVENT) & 0xff,
              (rec->events >> RTEMS_CAPTURE_CURR_PRIORITY_EVENT) & 0xff,
              rtems_capture_event_text (e));
+      if (format == 'c') 
+      {
+        *in32++ = (rec->events >> RTEMS_CAPTURE_REAL_PRIORITY_EVENT) & 0xff;
+        *in32++ = (rec->events >> RTEMS_CAPTURE_CURR_PRIORITY_EVENT) & 0xff;
+        *in32++ = (uint32_t) e; //id for event
+        in += 3;
+      }
     }
     event >>= 1;
   }
+  return in;
 }
 
 /*
@@ -260,13 +333,35 @@ rtems_capture_print_record_capture(int                         cpu,
  */
 
 void
-rtems_capture_print_trace_records (int total, bool csv)
+rtems_capture_print_trace_records ( int total, bool csv, char format, char* trace_file_name ) 
 {
   ctrace_per_cpu*    per_cpu;
   ctrace_per_cpu*    cpu;
   int                cpus;
   rtems_capture_time last_time = 0;
   int                i;
+  char                    buf [1024];
+
+  FILE* trace_file = fopen (trace_file_name, "a+b");
+
+  if (format == 'c')
+  {
+    if (trace_file == NULL)
+    {
+      perror (trace_file);
+      printf ("error: opening CTF trace stream file, error no: %d\n", errno);
+      return;
+    }
+    else
+    {
+      uint32_t magic = 3254525889, stream_id = 0;
+      if (ftell (trace_file) == 0)
+      {
+        fwrite (&magic, 1, sizeof (uint32_t), trace_file);
+        fwrite (&stream_id, 1, sizeof (uint32_t), trace_file);
+      }
+    }
+  }
 
   cpus = rtems_get_processor_count ();
 
@@ -350,7 +445,8 @@ rtems_capture_print_trace_records (int total, bool csv)
                                                   &task_rec,
                                                   sizeof (task_rec));
         ctrace_task_name_add (rec_out->task_id, &task_rec.name);
-        rtems_capture_print_record_task (cpu_out, rec_out, &task_rec);
+        uint32_t offset = rtems_capture_print_record_task (cpu_out, rec_out, &task_rec, buf, format);
+        fwrite (buf, 1, offset * sizeof(uint32_t), trace_file);
       }
       else
       {
@@ -362,7 +458,8 @@ rtems_capture_print_trace_records (int total, bool csv)
           diff = 0;
         last_time = rec_out->time;
         ctrace_task_name_find (rec_out->task_id, &name);
-        rtems_capture_print_record_capture (cpu_out, rec_out, diff, name);
+        uint32_t offset = rtems_capture_print_record_capture( cpu, rec_out, diff, name, buf, format );
+        fwrite (buf, 1, offset * sizeof(uint32_t), trace_file);
         if ((rec_out->events &
              (RTEMS_CAPTURE_DELETED_BY_EVENT | RTEMS_CAPTURE_DELETED_EVENT)) != 0)
           ctrace_task_name_remove (rec_out->task_id);
@@ -396,6 +493,7 @@ rtems_capture_print_trace_records (int total, bool csv)
     }
   }
 
+  fclose (trace_file); 
   free(per_cpu);
 }
 

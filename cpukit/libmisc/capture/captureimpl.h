@@ -32,6 +32,7 @@
 #define __CAPTUREIMPL_H_
 
 #include "capture.h"
+#include <stdio.h> 
 
 /**@{*/
 #ifdef __cplusplus
@@ -128,7 +129,7 @@ bool rtems_capture_trigger_fired (rtems_tcb* ft,
  * @param[in] total specifies the number of records to print
  * @param[in] csv specifies a comma seperated value format
  */
-void rtems_capture_print_trace_records ( int total, bool csv );
+void rtems_capture_print_trace_records ( int total, bool csv, char trace_format, char* trace_filename );
 
 /**
  * @brief Capture print timestamp.
@@ -149,9 +150,11 @@ void rtems_capture_print_timestamp (uint64_t uptime);
  * @param[in] cpu specifies the cpu the cpu the record was logged on.
  * @param[in] rec specifies the task record.
  */
-void rtems_capture_print_record_task(int                              cpu,
+uint32_t rtems_capture_print_record_task(int                              cpu,
                                      const rtems_capture_record*      rec,
-                                     const rtems_capture_task_record* task_rec);
+                                     const rtems_capture_task_record* task_rec,
+				     char*			      buf,
+				     char			      format);
 
 /**
  * @brief Capture print capture record.
@@ -165,10 +168,12 @@ void rtems_capture_print_record_task(int                              cpu,
  * @param[in] name specifies the name of the task, NULL if none.
  * @param[in] task_count number of tasks to search for.
  */
-void rtems_capture_print_record_capture(int                         cpu,
+uint32_t rtems_capture_print_record_capture(int                         cpu,
                                         const rtems_capture_record* rec,
                                         uint64_t                    diff,
-                                        const rtems_name*           name);
+                                        const rtems_name*           name,
+					char*			    buf,
+					char			    format);
 
 /**
  * @brief Capture print watch list
@@ -177,7 +182,7 @@ void rtems_capture_print_record_capture(int                         cpu,
  */
 void rtems_capture_print_watch_list (void);
 
-#ifdef __cplusplus
+#ifdef __cplusplusx`
 }
 #endif
 /**@}*/
