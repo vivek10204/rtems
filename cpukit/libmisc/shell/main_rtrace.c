@@ -256,11 +256,12 @@ rtems_trace_buffering_shell_trace (int argc, char *argv[])
   uint32_t* trace_buffer;
   uint32_t  records;
   uint32_t  traces;
-  uint32_t  r;
+  uint32_t  r, x = 0, y = 0;
   size_t    start = 0;
   size_t    end = 40;
   size_t    count;
   uint64_t  last_sample = 0;
+  char      format = 'n';
 
   if (!rtems_trace_buffering_present ())
     return rtems_trace_buffering_no_trace_buffer_code ();
@@ -271,14 +272,24 @@ rtems_trace_buffering_shell_trace (int argc, char *argv[])
 
   if (argc > 1)
   {
-    if (argc > 3)
+    if (argc > 4)
       return rtems_trace_buffering_wrong_number_of_args ();
 
-    if (argv[1][0] == '+')
+    if (argc == 3 && argv[2][0] == '+' && (argv[1][0] == 'c' || argv[1][0] == 'n'))
     {
-      if (argc > 2)
+      x = 2;
+      format = argv[1][0];
+    }
+    else if (argc == 2 && argv[1][0] == '+')
+      x = 1;
+    else if (argc == 2)
+      format = argv[1][0];
+    else if (argc > 4)
         return rtems_trace_buffering_wrong_number_of_args ();
-      end = strtoul (argv[1] + 1, 0, 0);
+
+    if (x != 0)
+    {
+      end = strtoul (argv[x] + 1, 0, 0);
       if (end == 0)
       {
         printf("error: invalid number of lines\n");
@@ -288,7 +299,7 @@ rtems_trace_buffering_shell_trace (int argc, char *argv[])
     }
     else
     {
-      start = strtoul (argv[1], 0, 0);
+      start = strtoul (argv[x], 0, 0);
       if (start >= records)
       {
         printf ("error: start record out of range (max %" PRIu32 ")\n", records);
@@ -298,11 +309,19 @@ rtems_trace_buffering_shell_trace (int argc, char *argv[])
 
     end += start;
 
-    if (argc == 3)
+    if (argc == 3 && x != 2)
     {
-      if (argv[2][0] == '+')
+      y = 2;
+    }
+    else if (argc == 4)
+    {
+      y = 3;
+    }
+    if (y != 0)
+    {
+      if (argv[y][0] == '+')
       {
-        end = strtoul (argv[2] + 1, 0, 0);
+        end = strtoul (argv[y] + 1, 0, 0);
         if (end == 0)
         {
           printf("error: invalid number of lines\n");
@@ -312,7 +331,7 @@ rtems_trace_buffering_shell_trace (int argc, char *argv[])
       }
       else
       {
-        end = strtoul (argv[2], 0, 0);
+        end = strtoul (argv[y], 0, 0);
         if (end < start)
         {
           printf ("error: end record before start\n");
@@ -343,6 +362,15 @@ rtems_trace_buffering_shell_trace (int argc, char *argv[])
 
   while ((r < records) && (count < end))
   {
+    if (format == 'c' && count == start)
+      r = r + 3;
+    if (format == 'c' && count > start)
+    {
+      if (trace_buffer[r] == -1040441407)
+        r = r + 3;
+      else
+        r = r + 1;
+    }
     const uint32_t header = trace_buffer[r];
     const uint32_t func_index = header & 0xffff;
     const uint32_t len = (header >> 16) & 0x0fff;
@@ -590,6 +618,66 @@ rtems_trace_buffering_shell_save (int argc, char *argv[])
   return 0;
 }
 
+static int
+rtems_trace_buffering_shell_save_raw (int argc, char *argv[])
+{
+  uint32_t* trace_buffer;
+  uint32_t  records;
+  uint32_t* buffer;
+  size_t    length;
+  FILE      *out;
+  uint32_t  prev_stream_id = -1;
+
+  if (argc != 1)
+    return rtems_trace_buffering_wrong_number_of_args ();
+
+  if (!rtems_trace_buffering_present ())
+    return rtems_trace_buffering_no_trace_buffer_code ();
+
+  rtems_trace_buffering_banner ("trace");
+
+  if (!rtems_trace_buffering_finished ())
+  {
+    printf("tracing still running\n");
+    return 0;
+  }
+
+  trace_buffer = rtems_trace_buffering_buffer ();
+  records = rtems_trace_buffering_buffer_in ();
+  uint32_t traces = rtems_trace_names_size ();
+
+  buffer = (uint32_t*) trace_buffer;
+  buffer += 15;
+  records = records - 15;
+  length = records * sizeof (uint32_t);
+  while (length > 0)
+  {
+    if (*buffer == -1040441407)
+    {
+      if (*(buffer + 1) != prev_stream_id)
+      {
+        char *snum;
+        if (prev_stream_id != -1)
+          fclose (out);
+        itoa (*(buffer + 1), snum, 5);
+        out = fopen (snum, "a+b");
+        fseek (out, 0, SEEK_END);
+        prev_stream_id = *(buffer + 1);
+      }
+      if (ftell (out) != 0)
+      {
+        buffer += 2;
+        length -= 8;
+      }
+    }
+    fwrite (buffer, 1, 4, out);
+    buffer += 1;
+    length -= 4;
+  }
+  fclose (out);
+  return 0;
+}
+
 static void
 rtems_trace_buffering_shell_usage (const char* arg)
 {
@@ -631,12 +719,17 @@ static const rtems_trace_buffering_shell_cmd_t table[] =
   {
     "trace",
     rtems_trace_buffering_shell_trace,
-    " [start] [end/+length] : List the current trace records"
+    " [format] [start] [end/+length] : List the current trace records"
   },
   {
     "save",
     rtems_trace_buffering_shell_save,
     " file                  : Save the trace buffer to a file"
+  },
+  {
+    "save-raw",
+    rtems_trace_buffering_shell_save_raw,
+    "                       : Save the raw trace buffer to a file"
   },
 };
 
