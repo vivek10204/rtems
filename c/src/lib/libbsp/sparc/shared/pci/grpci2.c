@@ -57,6 +57,9 @@
 /* If defined to 1 - byte twisting is enabled by default */
 #define DEFAULT_BT_ENABLED 0
 
+/* If defined to 64 - Latency timer is 64 by default */
+#define DEFAULT_LATENCY_TIMER 64
+
 /* Interrupt assignment. Set to other value than 0xff in order to 
  * override defaults and plug&play information
  */
@@ -102,8 +105,8 @@ struct grpci2_regs {
 
 #define CTRL_SI (1<<27)
 #define CTRL_PE (1<<26)
-#define CTRL_EI (1<<25)
-#define CTRL_ER (1<<24)
+#define CTRL_ER (1<<25)
+#define CTRL_EI (1<<24)
 #define CTRL_BUS (0xff<<CTRL_BUS_BIT)
 #define CTRL_HOSTINT 0xf
 
@@ -132,11 +135,12 @@ struct grpci2_regs {
 #define STS_TRACE	(1<<STS_TRACE_BIT)
 #define STS_CFGERRVALID	(1<<STS_CFGERRVALID_BIT)
 #define STS_CFGERR	(1<<STS_CFGERR_BIT)
-#define STS_INTTYPE	(0x3f<<STS_INTTYPE_BIT)
+#define STS_INTTYPE	(0x7f<<STS_INTTYPE_BIT)
 #define STS_INTSTS	(0xf<<STS_INTSTS_BIT)
 #define STS_FDEPTH	(0x7<<STS_FDEPTH_BIT)
 #define STS_FNUM	(0x3<<STS_FNUM_BIT)
 
+#define STS_ITIMEOUT	(1<<18)
 #define STS_ISYSERR	(1<<17)
 #define STS_IDMA	(1<<16)
 #define STS_IDMAERR	(1<<15)
@@ -151,10 +155,12 @@ struct grpci2_bd_chan {
 	volatile unsigned int res;	/* 0x0C Reserved */
 };
 
-#define BD_CHAN_EN		0x80000000
-#define BD_CHAN_TYPE		0x00300000
-#define BD_CHAN_BDCNT		0x0000ffff
+#define BD_CHAN_EN		(1<<BD_CHAN_EN_BIT)
+#define BD_CHAN_ID		(0x3<<BD_CHAN_ID_BIT)
+#define BD_CHAN_TYPE		(0x3<<BD_CHAN_TYPE_BIT)
+#define BD_CHAN_BDCNT		(0xffff<<BD_CHAN_BDCNT_BIT)
 #define BD_CHAN_EN_BIT		31
+#define BD_CHAN_ID_BIT		22
 #define BD_CHAN_TYPE_BIT	20
 #define BD_CHAN_BDCNT_BIT	0
 
@@ -165,15 +171,17 @@ struct grpci2_bd_data {
 	volatile unsigned int next;	/* 0x0C Next Data Descriptor in channel */
 };
 
-#define BD_DATA_EN		0x80000000
-#define BD_DATA_IE		0x40000000
-#define BD_DATA_DR		0x20000000
-#define BD_DATA_TYPE		0x00300000
-#define BD_DATA_ER		0x00080000
-#define BD_DATA_LEN		0x0000ffff
+#define BD_DATA_EN		(0x1<<BD_DATA_EN_BIT)
+#define BD_DATA_IE		(0x1<<BD_DATA_IE_BIT)
+#define BD_DATA_DR		(0x1<<BD_DATA_DR_BIT)
+#define BD_DATA_BE		(0x1<<BD_DATA_BE_BIT)
+#define BD_DATA_TYPE		(0x3<<BD_DATA_TYPE_BIT)
+#define BD_DATA_ER		(0x1<<BD_DATA_ER_BIT)
+#define BD_DATA_LEN		(0xffff<<BD_DATA_LEN_BIT)
 #define BD_DATA_EN_BIT		31
 #define BD_DATA_IE_BIT		30
 #define BD_DATA_DR_BIT		29
+#define BD_DATA_BE_BIT		28
 #define BD_DATA_TYPE_BIT	20
 #define BD_DATA_ER_BIT		19
 #define BD_DATA_LEN_BIT		0
@@ -232,6 +240,7 @@ struct grpci2_priv {
 	char				irq_mode; /* IRQ Mode from CAPSTS REG */
 	char				bt_enabled;
 	unsigned int			irq_mask;
+	unsigned int			latency_timer;
 
 	struct grpci2_pcibar_cfg	*barcfg;
 
@@ -607,7 +616,7 @@ void grpci2_err_isr(void *arg)
 	struct grpci2_priv *priv = arg;
 	unsigned int sts = priv->regs->sts_cap;
 
-	if (sts & (STS_IMSTABRT | STS_ITGTABRT | STS_IPARERR | STS_ISYSERR)) {
+	if (sts & (STS_IMSTABRT | STS_ITGTABRT | STS_IPARERR | STS_ISYSERR | STS_ITIMEOUT)) {
 		/* A PCI error IRQ ... Error handler unimplemented
 		 * add your code here...
 		 */
@@ -622,6 +631,9 @@ void grpci2_err_isr(void *arg)
 		}
 		if (sts & STS_ISYSERR) {
 			printk("GRPCI2: unhandled System Error IRQ\n");
+		}
+		if (sts & STS_ITIMEOUT) {
+			printk("GRPCI2: unhandled PCI target access timeout IRQ\n");
 		}
 	}
 }
@@ -688,6 +700,12 @@ static int grpci2_hw_init(struct grpci2_priv *priv)
 	data |= (PCIM_CMD_MEMEN | PCIM_CMD_BUSMASTEREN);
 	grpci2_cfg_w32(host, PCIR_COMMAND, data);
 
+	/* set latency timer */
+	grpci2_cfg_r32(host, PCIR_CACHELNSZ, &data);
+	data &= ~0xff00;
+	data |= ((priv->latency_timer & 0xff) << 8);
+	grpci2_cfg_w32(host, PCIR_CACHELNSZ, data);
+
 	/* Enable Error respone (CPU-TRAP) on illegal memory access */
 	regs->ctrl = CTRL_ER | CTRL_PE;
 
@@ -725,6 +743,7 @@ static int grpci2_init(struct grpci2_priv *priv)
 	priv->regs = (struct grpci2_regs *)apb->start;
 	priv->bt_enabled = DEFAULT_BT_ENABLED;
 	priv->irq_mode = (priv->regs->sts_cap & STS_IRQMODE) >> STS_IRQMODE_BIT;
+	priv->latency_timer = DEFAULT_LATENCY_TIMER;
 
 	/* Calculate the PCI windows 
 	 *  AMBA->PCI Window:                       AHB SLAVE AREA0
@@ -782,6 +801,11 @@ static int grpci2_init(struct grpci2_priv *priv)
 		priv->barcfg = value->ptr;
 	else
 		priv->barcfg = grpci2_default_bar_mapping;
+
+	/* User may override DEFAULT_LATENCY_TIMER */
+	value = drvmgr_dev_key_get(priv->dev, "latencyTimer", DRVMGR_KT_INT);
+	if (value)
+		priv->latency_timer = value->i;
 
 	/* This driver only support HOST systems, we check that it can act as a 
 	 * PCI Master and that it is in the Host slot. */

@@ -110,11 +110,9 @@ fat_file_open(
     /* access "removed-but-still-open" hash table */
     rc = _hash_search(fs_info, fs_info->rhash, key, key, &lfat_fd);
 
-    lfat_fd = (*fat_fd) = (fat_file_fd_t*)malloc(sizeof(fat_file_fd_t));
+    lfat_fd = (*fat_fd) = (fat_file_fd_t*)calloc(1, sizeof(fat_file_fd_t));
     if ( lfat_fd == NULL )
         rtems_set_errno_and_return_minus_one( ENOMEM );
-
-    memset(lfat_fd, 0, sizeof(fat_file_fd_t));
 
     lfat_fd->links_num = 1;
     lfat_fd->flags &= ~FAT_FILE_REMOVED;
@@ -403,20 +401,18 @@ static bool
  *     start            - offset(in bytes) to write from
  *     count            - count
  *     buf              - buffer provided by user
- *     file_cln_initial - initial current cluster number of the file
  *
  * RETURNS:
  *     number of bytes actually written to the file on success, or -1 if
  *     error occured (errno set appropriately)
  */
 static ssize_t
- fat_file_write_fat32_or_non_root_dir(
+fat_file_write_fat32_or_non_root_dir(
      fat_fs_info_t                        *fs_info,
      fat_file_fd_t                        *fat_fd,
      const uint32_t                        start,
      const uint32_t                        count,
-     const uint8_t                        *buf,
-     const uint32_t                        file_cln_initial)
+     const uint8_t                        *buf)
 {
     int            rc = RC_OK;
     uint32_t       cmpltd = 0;
@@ -426,35 +422,27 @@ static ssize_t
     uint32_t       ofs_cln = start - (start_cln << fs_info->vol.bpc_log2);
     uint32_t       ofs_cln_save = ofs_cln;
     uint32_t       bytes_to_write = count;
-    uint32_t       file_cln_cnt;
     ssize_t        ret;
     uint32_t       c;
-    bool           overwrite_cluster = false;
 
     rc = fat_file_lseek(fs_info, fat_fd, start_cln, &cur_cln);
     if (RC_OK == rc)
     {
-        file_cln_cnt = cur_cln - fat_fd->cln;
         while (   (RC_OK == rc)
                && (bytes_to_write > 0))
         {
             c = MIN(bytes_to_write, (fs_info->vol.bpc - ofs_cln));
 
-            if (file_cln_initial < file_cln_cnt)
-                overwrite_cluster = true;
-
             ret = fat_cluster_write(fs_info,
                                       cur_cln,
                                       ofs_cln,
                                       c,
-                                      &buf[cmpltd],
-                                      overwrite_cluster);
+                                      &buf[cmpltd]);
             if (0 > ret)
               rc = -1;
 
             if (RC_OK == rc)
             {
-                ++file_cln_cnt;
                 bytes_to_write -= ret;
                 cmpltd += ret;
                 save_cln = cur_cln;
@@ -509,7 +497,6 @@ fat_file_write(
     uint32_t       byte;
     uint32_t       c = 0;
     bool           zero_fill = start > fat_fd->fat_file_size;
-    uint32_t       file_cln_initial = fat_fd->map.file_cln;
     uint32_t       cln;
 
 
@@ -543,8 +530,7 @@ fat_file_write(
                                       cln,
                                       byte,
                                       count,
-                                      buf,
-                                      false);
+                                      buf);
             if (0 > ret)
               rc = -1;
             else
@@ -556,8 +542,7 @@ fat_file_write(
                                                        fat_fd,
                                                        start,
                                                        count,
-                                                       buf,
-                                                       file_cln_initial);
+                                                       buf);
             if (0 > ret)
               rc = -1;
             else

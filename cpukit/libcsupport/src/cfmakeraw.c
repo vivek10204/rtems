@@ -54,11 +54,13 @@ cfmakeraw(
   struct termios *tp
 )
 {
-  tp->c_iflag &= ~(IMAXBEL|IGNBRK|BRKINT|PARMRK|ISTRIP|INLCR|IGNCR|ICRNL|IXON);
+  tp->c_iflag &= ~(IMAXBEL|IXOFF|INPCK|BRKINT|PARMRK|ISTRIP|INLCR|IGNCR|ICRNL|IXON|IGNPAR);
+  tp->c_iflag |= IGNBRK;
   tp->c_oflag &= ~OPOST;
-  tp->c_lflag &= ~(ECHO|ECHONL|ICANON|ISIG|IEXTEN);
+  tp->c_lflag &= ~(ECHO|ECHOE|ECHOK|ECHONL|ICANON|ISIG|IEXTEN|NOFLSH|TOSTOP|PENDIN);
   tp->c_cflag &= ~(CSIZE|PARENB);
-  tp->c_cflag |= CS8;
-  /* XXX set MIN/TIME */
+  tp->c_cflag |= CS8|CREAD;
+  tp->c_cc[VMIN] = 1;
+  tp->c_cc[VTIME] = 0;
 }
 #endif

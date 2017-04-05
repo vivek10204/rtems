@@ -527,20 +527,18 @@ extern const rtems_assoc_t rtems_termios_baud_table [];
  *  @retval B0 Invalid baud value or a baud value of 0.
  *  @retval other Baud constant according to @a baud.
  */
-tcflag_t rtems_termios_number_to_baud(rtems_termios_baud_t baud);
+speed_t rtems_termios_number_to_baud(rtems_termios_baud_t baud);
 
 /**
- *  @brief Convert Baud Part of Termios control flags to an integral Baud Value
- *
- *  There is no need to mask the @a c_cflag with @c CBAUD.
+ *  @brief Converts the baud flags to an integral baud value.
  *
  *  @retval 0 Invalid baud value or a baud value of @c B0.
  *  @retval other Integral baud value.
  */
-rtems_termios_baud_t rtems_termios_baud_to_number(tcflag_t c_cflag);
+rtems_termios_baud_t rtems_termios_baud_to_number(speed_t baud);
 
-/** 
- *  @brief Convert Bxxx Constant to Index 
+/**
+ *  @brief Convert Bxxx Constant to Index
  */
 int  rtems_termios_baud_to_index(rtems_termios_baud_t termios_baud);
 

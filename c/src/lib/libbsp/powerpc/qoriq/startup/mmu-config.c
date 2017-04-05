@@ -179,19 +179,27 @@ static void TEXT config_fdt_adjust(void)
 
 		size = MIN(size, 0x80000000U);
 
-		if (begin == 0 && size > (uintptr_t) bsp_section_work_end) {
+		if (
+			begin == 0
+				&& size > (uintptr_t) bsp_section_work_end
+				&& (uintptr_t) bsp_section_nocache_end
+					< (uintptr_t) bsp_section_work_end
+		) {
 			config[WORKSPACE_ENTRY_INDEX].size += (uintptr_t) size
 				- (uintptr_t) bsp_section_work_end;
 		}
 	}
 }
 
-void TEXT qoriq_mmu_config(int first_tlb, int scratch_tlb)
+void TEXT qoriq_mmu_config(bool boot_processor, int first_tlb, int scratch_tlb)
 {
 	qoriq_mmu_context context;
 	int i = 0;
 
-	config_fdt_adjust();
+	if (boot_processor) {
+		config_fdt_adjust();
+	}
+
 	qoriq_mmu_context_init(&context);
 
 	for (i = 0; i < QORIQ_TLB1_ENTRY_COUNT; ++i) {

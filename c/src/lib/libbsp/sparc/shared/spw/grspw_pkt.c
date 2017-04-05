@@ -28,33 +28,38 @@
 #include <drvmgr/ambapp_bus.h>
 #include <bsp/grspw_pkt.h>
 
-/* This driver has been prepared for SMP operation however never tested 
- * on a SMP system - use on your own risk.
+/* Use interrupt lock privmitives compatible with SMP defined in
+ * RTEMS 4.11.99 and higher.
  */
-#ifdef RTEMS_HAS_SMP
+#if (((__RTEMS_MAJOR__ << 16) | (__RTEMS_MINOR__ << 8) | __RTEMS_REVISION__) >= 0x040b63)
 
-#include <rtems/score/smplock.h> /* spin-lock */
+#include <rtems/score/isrlock.h> /* spin-lock */
 
-/* SPIN_LOCK() and SPIN_UNLOCK() NOT_IMPLEMENTED_BY_RTEMS. Use _IRQ version
- * to implement.
- */
-#define SPIN_DECLARE(name) SMP_lock_spinlock_simple_Control name
-#define SPIN_INIT(lock) _SMP_lock_spinlock_simple_Initialize(lock)
-#define SPIN_LOCK(lock, level) SPIN_LOCK_IRQ(lock, level)
-#define SPIN_LOCK_IRQ(lock, level) (level) = _SMP_lock_spinlock_simple_Obtain(lock)
-#define SPIN_UNLOCK(lock, level) SPIN_UNLOCK_IRQ(lock, level)
-#define SPIN_UNLOCK_IRQ(lock, level) _SMP_lock_spinlock_simple_Release(lock, level)
-#define IRQFLAGS_TYPE ISR_Level
+/* map via ISR lock: */
+#define SPIN_DECLARE(lock) ISR_LOCK_MEMBER(lock)
+#define SPIN_INIT(lock, name) _ISR_lock_Initialize(lock, name)
+#define SPIN_LOCK(lock, level) _ISR_lock_Acquire_inline(lock, &level)
+#define SPIN_LOCK_IRQ(lock, level) _ISR_lock_ISR_disable_and_acquire(lock, &level)
+#define SPIN_UNLOCK(lock, level) _ISR_lock_Release_inline(lock, &level)
+#define SPIN_UNLOCK_IRQ(lock, level) _ISR_lock_Release_and_ISR_enable(lock, &level)
+#define SPIN_IRQFLAGS(k) ISR_lock_Context k
+#define SPIN_ISR_IRQFLAGS(k) SPIN_IRQFLAGS(k)
 
 #else
 
+/* maintain single-core compatibility with older versions of RTEMS: */
 #define SPIN_DECLARE(name)
-#define SPIN_INIT(lock)
+#define SPIN_INIT(lock, name)
 #define SPIN_LOCK(lock, level)
 #define SPIN_LOCK_IRQ(lock, level) rtems_interrupt_disable(level)
 #define SPIN_UNLOCK(lock, level)
 #define SPIN_UNLOCK_IRQ(lock, level) rtems_interrupt_enable(level)
-#define IRQFLAGS_TYPE rtems_interrupt_level
+#define SPIN_IRQFLAGS(k) rtems_interrupt_level k
+#define SPIN_ISR_IRQFLAGS(k)
+
+#ifdef RTEMS_SMP
+#error SMP mode not compatible with these interrupt lock primitives
+#endif
 
 #endif
 
@@ -266,7 +271,7 @@ struct grspw_regs {
 #define GRSPW_ICCTRL_ID_BIT	7
 #define GRSPW_ICCTRL_II_BIT	6
 #define GRSPW_ICCTRL_TXIRQ_BIT	0
-#define GRSPW_ICCTRL_INUM	(0x3f << GRSPW_ICCTRL_INUM_BIT)
+#define GRSPW_ICCTRL_INUM	(0x1f << GRSPW_ICCTRL_INUM_BIT)
 #define GRSPW_ICCTRL_IA		(1 << GRSPW_ICCTRL_IA_BIT)
 #define GRSPW_ICCTRL_LE		(1 << GRSPW_ICCTRL_LE_BIT)
 #define GRSPW_ICCTRL_PR		(1 << GRSPW_ICCTRL_PR_BIT)
@@ -334,6 +339,8 @@ struct grspw_txbd {
 /* GRSPW Constants */
 #define GRSPW_TXBD_NR 64	/* Maximum number of TX Descriptors */
 #define GRSPW_RXBD_NR 128	/* Maximum number of RX Descriptors */
+#define GRSPW_TXBD_SIZE 16	/* Size in bytes of one TX descriptor */
+#define GRSPW_RXBD_SIZE 8	/* Size in bytes of one RX descriptor */
 #define BDTAB_SIZE 0x400	/* BD Table Size (RX or TX) */
 #define BDTAB_ALIGN 0x400	/* BD Table Alignment Requirement */
 
@@ -374,7 +381,8 @@ struct grspw_dma_priv {
 	int index;			/* DMA Channel Index @ GRSPW core */
 	int open;			/* DMA Channel opened by user */
 	int started;			/* DMA Channel activity (start|stop) */
-	rtems_id sem_dma;		/* DMA Channel Semaphore */
+	rtems_id sem_rxdma;		/* DMA Channel RX Semaphore */
+	rtems_id sem_txdma;		/* DMA Channel TX Semaphore */
 	struct grspw_dma_stats stats;	/* DMA Channel Statistics */
 	struct grspw_dma_config cfg;	/* DMA Channel Configuration */
 
@@ -469,8 +477,14 @@ struct grspw_priv {
 	spwpkt_ic_isr_t icisr;
 	void *icisr_arg;
 
-	/* Disable Link on SpW Link error */
-	int dis_link_on_err;
+	/* Bit mask representing events which shall cause link disable. */
+	unsigned int dis_link_on_err;
+
+	/* Bit mask for link status bits to clear by ISR */
+	unsigned int stscfg;
+
+	/*** Message Queue Handling ***/
+	struct grspw_work_config wc;
 
 	/* "Core Global" Statistics gathered, not dependent on DMA channel */
 	struct grspw_core_stats stats;
@@ -478,7 +492,6 @@ struct grspw_priv {
 
 int grspw_initialized = 0;
 int grspw_count = 0;
-struct workqueue_struct *grspw_workq = NULL;
 rtems_id grspw_sem;
 static struct grspw_priv *priv_tab[GRSPW_MAX];
 
@@ -486,20 +499,22 @@ static struct grspw_priv *priv_tab[GRSPW_MAX];
 void *(*grspw_dev_add)(int) = NULL;
 void (*grspw_dev_del)(int,void*) = NULL;
 
+/* Defaults to do nothing - user can override this function.
+ * Called from work-task.
+ */
+void __attribute__((weak)) grspw_work_event(
+	enum grspw_worktask_ev ev,
+	unsigned int msg)
+{
+
+}
+
 /* USER OVERRIDABLE - The work task priority. Set to -1 to disable creating
  * the work-task and work-queue to save space.
  */
 int grspw_work_task_priority __attribute__((weak)) = 100;
-int grspw_task_stop = 0;
 rtems_id grspw_work_task;
-rtems_id grspw_work_queue = 0;
-#define WORK_NONE         0
-#define WORK_SHUTDOWN     0x100
-#define WORK_DMA(channel) (0x1 << (channel))
-#define WORK_DMA_MASK     0xf /* max 4 channels */
-#define WORK_CORE_BIT     16
-#define WORK_CORE_MASK    0xffff
-#define WORK_CORE(device) ((device) << WORK_CORE_BIT)
+static struct grspw_work_config grspw_wc_def;
 
 STATIC void grspw_hw_stop(struct grspw_priv *priv);
 STATIC void grspw_hw_dma_stop(struct grspw_dma_priv *dma);
@@ -532,12 +547,18 @@ void *grspw_open(int dev_no)
 	/* Initialize Spin-lock for GRSPW Device. This is to protect
 	 * CTRL and DMACTRL registers from ISR.
 	 */
-	SPIN_INIT(&priv->devlock);
+	SPIN_INIT(&priv->devlock, priv->devname);
 
 	priv->tcisr = NULL;
 	priv->tcisr_arg = NULL;
 	priv->icisr = NULL;
 	priv->icisr_arg = NULL;
+	priv->stscfg = LINKSTS_MASK;
+
+	/* Default to common work queue and message queue, if not created
+	 * during initialization then its disabled.
+	 */
+	grspw_work_cfg(priv, &grspw_wc_def);
 
 	grspw_stats_clr(priv);
 
@@ -545,6 +566,7 @@ void *grspw_open(int dev_no)
 	 * channels. Max-size descriptor area is allocated (or user assigned):
 	 *  - 128 RX descriptors per DMA Channel
 	 *  - 64 TX descriptors per DMA Channel
+	 * Specified address must be in CPU RAM.
  	 */
 	bdtabsize = 2 * BDTAB_SIZE * priv->hwsup.ndma_chans;
 	value = drvmgr_dev_key_get(priv->dev, "bdDmaArea", DRVMGR_KT_INT);
@@ -618,7 +640,7 @@ out:
 	return priv;
 }
 
-void grspw_close(void *d)
+int grspw_close(void *d)
 {
 	struct grspw_priv *priv = d;
 	int i;
@@ -626,21 +648,33 @@ void grspw_close(void *d)
 	/* Take GRSPW lock - Wait until we get semaphore */
 	if (rtems_semaphore_obtain(grspw_sem, RTEMS_WAIT, RTEMS_NO_TIMEOUT)
 	    != RTEMS_SUCCESSFUL)
-		return;
+		return -1;
 
-	/* Stop Hardware from doing DMA, put HW into "startup-state",
-	 * Stop hardware from generating IRQ.
+	/* Check that user has stopped and closed all DMA channels
+	 * appropriately. At this point the Hardware shall not be doing DMA
+	 * or generating Interrupts. We want HW in a "startup-state".
 	 */
-	for (i=0; i<priv->hwsup.ndma_chans; i++)
-		grspw_dma_close(&priv->dma[i]);
+	for (i=0; i<priv->hwsup.ndma_chans; i++) {
+		if (priv->dma[i].open) {
+			rtems_semaphore_release(grspw_sem);
+			return 1;
+		}
+	}
 	grspw_hw_stop(priv);
+
+	/* Uninstall Interrupt handler */
+	drvmgr_interrupt_unregister(priv->dev, 0, grspw_isr, priv);
+
+	/* Free descriptor table memory if allocated using malloc() */
+	if (priv->bd_mem_alloced) {
+		free((void *)priv->bd_mem_alloced);
+		priv->bd_mem_alloced = 0;
+	}
 
 	/* Mark not open */
 	priv->open = 0;
-
 	rtems_semaphore_release(grspw_sem);
-
-	/* Check that all threads are out? */
+	return 0;
 }
 
 void grspw_hw_support(void *d, struct grspw_hw_sup *hw)
@@ -655,7 +689,7 @@ void grspw_addr_ctrl(void *d, struct grspw_addr_config *cfg)
 	struct grspw_priv *priv = d;
 	struct grspw_regs *regs = priv->regs;
 	unsigned int ctrl, nodeaddr;
-	IRQFLAGS_TYPE irqflags;
+	SPIN_IRQFLAGS(irqflags);
 	int i;
 
 	if (!priv || !cfg)
@@ -710,12 +744,28 @@ void grspw_addr_ctrl(void *d, struct grspw_addr_config *cfg)
 	}
 }
 
+/* Return Current DMA CTRL/Status Register */
+unsigned int grspw_dma_ctrlsts(void *c)
+{
+	struct grspw_dma_priv *dma = c;
+
+	return REG_READ(&dma->regs->ctrl);
+}
+
 /* Return Current Status Register */
 unsigned int grspw_link_status(void *d)
 {
 	struct grspw_priv *priv = d;
 
 	return REG_READ(&priv->regs->status);
+}
+
+/* Clear Status Register bits */
+void grspw_link_status_clr(void *d, unsigned int mask)
+{
+	struct grspw_priv *priv = d;
+
+	REG_WRITE(&priv->regs->status, mask);
 }
 
 /* Return Current Link State */
@@ -736,12 +786,12 @@ static inline int grspw_is_irqsource_set(unsigned int ctrl, unsigned int icctrl)
 
 
 /* options and clkdiv [in/out]: set to -1 to only read current config */
-void grspw_link_ctrl(void *d, int *options, int *clkdiv)
+void grspw_link_ctrl(void *d, int *options, int *stscfg, int *clkdiv)
 {
 	struct grspw_priv *priv = d;
 	struct grspw_regs *regs = priv->regs;
 	unsigned int ctrl;
-	IRQFLAGS_TYPE irqflags;
+	SPIN_IRQFLAGS(irqflags);
 
 	/* Write? */
 	if (clkdiv) {
@@ -763,10 +813,21 @@ void grspw_link_ctrl(void *d, int *options, int *clkdiv)
 				ctrl &= ~GRSPW_CTRL_IE;
 
 			REG_WRITE(&regs->ctrl, ctrl);
-			priv->dis_link_on_err = (*options & LINKOPTS_DIS_ONERR) >> 3;
+			/* Store the link disable events for use in
+			ISR. The LINKOPTS_DIS_ON_* options are actually the
+			corresponding bits in the status register, shifted
+			by 16. */
+			priv->dis_link_on_err = *options &
+				(LINKOPTS_MASK_DIS_ON | LINKOPTS_DIS_ONERR);
 		}
 		SPIN_UNLOCK_IRQ(&priv->devlock, irqflags);
-		*options = (ctrl & GRSPW_LINK_CFG)|(priv->dis_link_on_err << 3);
+		*options = (ctrl & GRSPW_LINK_CFG) | priv->dis_link_on_err;
+	}
+	if (stscfg) {
+		if (*stscfg != -1) {
+			priv->stscfg = *stscfg & LINKSTS_MASK;
+		}
+		*stscfg = priv->stscfg;
 	}
 }
 
@@ -775,7 +836,7 @@ void grspw_tc_tx(void *d)
 {
 	struct grspw_priv *priv = d;
 	struct grspw_regs *regs = priv->regs;
-	IRQFLAGS_TYPE irqflags;
+	SPIN_IRQFLAGS(irqflags);
 
 	SPIN_LOCK_IRQ(&priv->devlock, irqflags);
 	REG_WRITE(&regs->ctrl, REG_READ(&regs->ctrl) | GRSPW_CTRL_TI);
@@ -787,7 +848,7 @@ void grspw_tc_ctrl(void *d, int *options)
 	struct grspw_priv *priv = d;
 	struct grspw_regs *regs = priv->regs;
 	unsigned int ctrl;
-	IRQFLAGS_TYPE irqflags;
+	SPIN_IRQFLAGS(irqflags);
 
 	if (options == NULL)
 		return;
@@ -827,14 +888,14 @@ void grspw_tc_isr(void *d, void (*tcisr)(void *data, int tc), void *data)
  */
 void grspw_tc_time(void *d, int *time)
 {
-        struct grspw_priv *priv = d;
-        struct grspw_regs *regs = priv->regs;
+	struct grspw_priv *priv = d;
+	struct grspw_regs *regs = priv->regs;
 
-        if (time == NULL)
-                return;
-        if (*time != -1)
-                REG_WRITE(&regs->time, *time & (GRSPW_TIME_TCNT | GRSPW_TIME_CTRL));
-        *time = REG_READ(&regs->time) & (GRSPW_TIME_TCNT | GRSPW_TIME_CTRL);
+	if (time == NULL)
+		return;
+	if (*time != -1)
+		REG_WRITE(&regs->time, *time & (GRSPW_TIME_TCNT | GRSPW_TIME_CTRL));
+	*time = REG_READ(&regs->time) & (GRSPW_TIME_TCNT | GRSPW_TIME_CTRL);
 }
 
 /* Generate Tick-In for the given Interrupt-code and check for generation
@@ -846,7 +907,7 @@ int grspw_ic_tickin(void *d, int ic)
 {
 	struct grspw_priv *priv = d;
 	struct grspw_regs *regs = priv->regs;
-	IRQFLAGS_TYPE irqflags;
+	SPIN_IRQFLAGS(irqflags);
 	unsigned int icctrl, mask;
 
 	/* Prepare before turning off IRQ */
@@ -884,7 +945,7 @@ void grspw_ic_ctrl(void *d, unsigned int *options)
 	struct grspw_regs *regs = priv->regs;
 	unsigned int ctrl;
 	unsigned int icctrl;
-	IRQFLAGS_TYPE irqflags;
+	SPIN_IRQFLAGS(irqflags);
 
 	if (options == NULL)
 		return;
@@ -986,7 +1047,7 @@ int grspw_rmap_ctrl(void *d, int *options, int *dstkey)
 	struct grspw_priv *priv = d;
 	struct grspw_regs *regs = priv->regs;
 	unsigned int ctrl;
-	IRQFLAGS_TYPE irqflags;
+	SPIN_IRQFLAGS(irqflags);
 
 	if (dstkey) {
 		if (*dstkey != -1)
@@ -1033,7 +1094,7 @@ int grspw_port_ctrl(void *d, int *port)
 	struct grspw_priv *priv = d;
 	struct grspw_regs *regs = priv->regs;
 	unsigned int ctrl;
-	IRQFLAGS_TYPE irqflags;
+	SPIN_IRQFLAGS(irqflags);
 
 	if (port == NULL)
 		return -1;
@@ -1170,7 +1231,7 @@ STATIC int grspw_rx_schedule_ready(struct grspw_dma_priv *dma)
 	struct grspw_rxring *curr_bd;
 	struct grspw_pkt *curr_pkt, *last_pkt;
 	struct grspw_list lst;
-	IRQFLAGS_TYPE irqflags;
+	SPIN_IRQFLAGS(irqflags);
 
 	/* Is Ready Q empty? */
 	if (grspw_list_is_empty(&dma->ready))
@@ -1384,7 +1445,7 @@ STATIC int grspw_tx_schedule_send(struct grspw_dma_priv *dma)
 	struct grspw_txring *curr_bd;
 	struct grspw_pkt *curr_pkt, *last_pkt;
 	struct grspw_list lst;
-	IRQFLAGS_TYPE irqflags;
+	SPIN_IRQFLAGS(irqflags);
 
 	/* Is Ready Q empty? */
 	if (grspw_list_is_empty(&dma->send))
@@ -1599,7 +1660,7 @@ void *grspw_dma_open(void *d, int chan_no)
 	struct grspw_dma_priv *dma;
 	int size;
 
-	if ((chan_no < 0) && (priv->hwsup.ndma_chans <= chan_no))
+	if ((chan_no < 0) || (priv->hwsup.ndma_chans <= chan_no))
 		return NULL;
 
 	dma = &priv->dma[chan_no];
@@ -1627,24 +1688,37 @@ void *grspw_dma_open(void *d, int chan_no)
 	dma->cfg.tx_irq_en_cnt = 0;
 	dma->cfg.flags = DMAFLAG_NO_SPILL;
 
+	/* set to NULL so that error exit works correctly */
+	dma->sem_rxdma = RTEMS_ID_NONE;
+	dma->sem_txdma = RTEMS_ID_NONE;
+	dma->rx_wait.sem_wait = RTEMS_ID_NONE;
+	dma->tx_wait.sem_wait = RTEMS_ID_NONE;
+	dma->rx_ring_base = NULL;
+
 	/* DMA Channel Semaphore created with count = 1 */
 	if (rtems_semaphore_create(
-	    rtems_build_name('S', 'D', '0' + priv->index, '0' + chan_no), 1,
+	    rtems_build_name('S', 'D', '0' + priv->index, '0' + chan_no*2), 1,
 	    RTEMS_FIFO | RTEMS_SIMPLE_BINARY_SEMAPHORE | \
 	    RTEMS_NO_INHERIT_PRIORITY | RTEMS_LOCAL | \
-	    RTEMS_NO_PRIORITY_CEILING, 0, &dma->sem_dma) != RTEMS_SUCCESSFUL) {
-		dma = NULL;
-		goto out;
+	    RTEMS_NO_PRIORITY_CEILING, 0, &dma->sem_rxdma) != RTEMS_SUCCESSFUL) {
+		dma->sem_rxdma = RTEMS_ID_NONE;
+		goto err;
+	}
+	if (rtems_semaphore_create(
+	    rtems_build_name('S', 'D', '0' + priv->index, '0' + chan_no*2+1), 1,
+	    RTEMS_FIFO | RTEMS_SIMPLE_BINARY_SEMAPHORE | \
+	    RTEMS_NO_INHERIT_PRIORITY | RTEMS_LOCAL | \
+	    RTEMS_NO_PRIORITY_CEILING, 0, &dma->sem_txdma) != RTEMS_SUCCESSFUL) {
+		dma->sem_txdma = RTEMS_ID_NONE;
+		goto err;
 	}
 
 	/* Allocate memory for the two descriptor rings */
 	size = sizeof(struct grspw_ring) * (GRSPW_RXBD_NR + GRSPW_TXBD_NR);
 	dma->rx_ring_base = (struct grspw_rxring *)malloc(size);
 	dma->tx_ring_base = (struct grspw_txring *)&dma->rx_ring_base[GRSPW_RXBD_NR];
-	if (dma->rx_ring_base == NULL) {
-		dma = NULL;
-		goto out;
-	}
+	if (dma->rx_ring_base == NULL)
+		goto err;
 
 	/* Create DMA RX and TX Channel sempahore with count = 0 */
 	if (rtems_semaphore_create(
@@ -1652,16 +1726,16 @@ void *grspw_dma_open(void *d, int chan_no)
 	    RTEMS_FIFO | RTEMS_SIMPLE_BINARY_SEMAPHORE | \
 	    RTEMS_NO_INHERIT_PRIORITY | RTEMS_LOCAL | \
 	    RTEMS_NO_PRIORITY_CEILING, 0, &dma->rx_wait.sem_wait) != RTEMS_SUCCESSFUL) {
-		dma = NULL;
-		goto out;
+		dma->rx_wait.sem_wait = RTEMS_ID_NONE;
+		goto err;
 	}
 	if (rtems_semaphore_create(
 	    rtems_build_name('S', 'T', '0' + priv->index, '0' + chan_no), 0,
 	    RTEMS_FIFO | RTEMS_SIMPLE_BINARY_SEMAPHORE | \
 	    RTEMS_NO_INHERIT_PRIORITY | RTEMS_LOCAL | \
 	    RTEMS_NO_PRIORITY_CEILING, 0, &dma->tx_wait.sem_wait) != RTEMS_SUCCESSFUL) {
-		dma = NULL;
-		goto out;
+		dma->tx_wait.sem_wait = RTEMS_ID_NONE;
+		goto err;
 	}
 
 	/* Reset software structures */
@@ -1674,6 +1748,21 @@ out:
 	rtems_semaphore_release(grspw_sem);
 
 	return dma;
+
+	/* initialization error happended */
+err:
+	if (dma->sem_rxdma != RTEMS_ID_NONE)
+		rtems_semaphore_delete(dma->sem_rxdma);
+	if (dma->sem_txdma != RTEMS_ID_NONE)
+		rtems_semaphore_delete(dma->sem_txdma);
+	if (dma->rx_wait.sem_wait != RTEMS_ID_NONE)
+		rtems_semaphore_delete(dma->rx_wait.sem_wait);
+	if (dma->tx_wait.sem_wait != RTEMS_ID_NONE)
+		rtems_semaphore_delete(dma->tx_wait.sem_wait);
+	if (dma->rx_ring_base)
+		free(dma->rx_ring_base);
+	dma = NULL;
+	goto out;
 }
 
 /* Initialize Software Structures:
@@ -1710,24 +1799,40 @@ STATIC void grspw_dma_reset(struct grspw_dma_priv *dma)
 	grspw_dma_stats_clr(dma);
 }
 
-void grspw_dma_close(void *c)
+int grspw_dma_close(void *c)
 {
 	struct grspw_dma_priv *dma = c;
 
 	if (!dma->open)
-		return;
+		return 0;
 
 	/* Take device lock - Wait until we get semaphore */
-	if (rtems_semaphore_obtain(dma->sem_dma, RTEMS_WAIT, RTEMS_NO_TIMEOUT)
+	if (rtems_semaphore_obtain(dma->sem_rxdma, RTEMS_WAIT, RTEMS_NO_TIMEOUT)
 	    != RTEMS_SUCCESSFUL)
-		return;
+		return -1;
+	if (rtems_semaphore_obtain(dma->sem_txdma, RTEMS_WAIT, RTEMS_NO_TIMEOUT)
+	    != RTEMS_SUCCESSFUL) {
+	    	rtems_semaphore_release(dma->sem_rxdma);
+		return -1;
+	}
 
-	grspw_dma_stop_locked(dma);
+	/* Can not close active DMA channel. User must stop DMA and make sure
+	 * no threads are active/blocked within driver.
+	 */
+	if (dma->started || dma->rx_wait.waiting || dma->tx_wait.waiting) {
+	    	rtems_semaphore_release(dma->sem_txdma);
+		rtems_semaphore_release(dma->sem_rxdma);
+		return 1;
+	}
 
 	/* Free resources */
 	rtems_semaphore_delete(dma->rx_wait.sem_wait);
 	rtems_semaphore_delete(dma->tx_wait.sem_wait);
-	rtems_semaphore_delete(dma->sem_dma); /* Release and delete lock */
+	/* Release and delete lock. Operations requiring lock will fail */
+	rtems_semaphore_delete(dma->sem_txdma);
+	rtems_semaphore_delete(dma->sem_rxdma);
+	dma->sem_txdma = RTEMS_ID_NONE;
+	dma->sem_rxdma = RTEMS_ID_NONE;
 
 	/* Free memory */
 	if (dma->rx_ring_base)
@@ -1736,6 +1841,53 @@ void grspw_dma_close(void *c)
 	dma->tx_ring_base = NULL;
 
 	dma->open = 0;
+	return 0;
+}
+
+unsigned int grspw_dma_enable_int(void *c, int rxtx, int force)
+{
+	struct grspw_dma_priv *dma = c;
+	int rc = 0;
+	unsigned int ctrl, ctrl_old;
+	SPIN_IRQFLAGS(irqflags);
+
+	SPIN_LOCK_IRQ(&dma->core->devlock, irqflags);
+	if (dma->started == 0) {
+		rc = 1; /* DMA stopped */
+		goto out;
+	}
+	ctrl = REG_READ(&dma->regs->ctrl);
+	ctrl_old = ctrl;
+
+	/* Read/Write DMA error ? */
+	if (ctrl & GRSPW_DMA_STATUS_ERROR) {
+		rc = 2; /* DMA error */
+		goto out;
+	}
+
+	/* DMA has finished a TX/RX packet and user wants work-task to
+	 * take care of DMA table processing.
+	 */
+	ctrl &= ~GRSPW_DMACTRL_AT;
+
+	if ((rxtx & 1) == 0)
+		ctrl &= ~GRSPW_DMACTRL_PR;
+	else if (force || ((dma->cfg.rx_irq_en_cnt != 0) ||
+		 (dma->cfg.flags & DMAFLAG2_RXIE)))
+		ctrl |= GRSPW_DMACTRL_RI;
+
+	if ((rxtx & 2) == 0)
+		ctrl &= ~GRSPW_DMACTRL_PS;
+	else if (force || ((dma->cfg.tx_irq_en_cnt != 0) ||
+		 (dma->cfg.flags & DMAFLAG2_TXIE)))
+		ctrl |= GRSPW_DMACTRL_TI;
+
+	REG_WRITE(&dma->regs->ctrl, ctrl);
+	/* Re-enabled interrupts previously enabled */
+	rc = ctrl_old & (GRSPW_DMACTRL_PR | GRSPW_DMACTRL_PS);
+out:
+	SPIN_UNLOCK_IRQ(&dma->core->devlock, irqflags);
+	return rc;
 }
 
 /* Schedule List of packets for transmission at some point in
@@ -1751,7 +1903,7 @@ int grspw_dma_tx_send(void *c, int opts, struct grspw_list *pkts, int count)
 	int ret;
 
 	/* Take DMA channel lock */
-	if (rtems_semaphore_obtain(dma->sem_dma, RTEMS_WAIT, RTEMS_NO_TIMEOUT)
+	if (rtems_semaphore_obtain(dma->sem_txdma, RTEMS_WAIT, RTEMS_NO_TIMEOUT)
 	    != RTEMS_SUCCESSFUL)
 		return -1;
 
@@ -1766,7 +1918,7 @@ int grspw_dma_tx_send(void *c, int opts, struct grspw_list *pkts, int count)
 		grspw_tx_process_scheduled(dma);
 
 	/* 2. Add the requested packets to the SEND List (USER->SEND) */
-	if (pkts) {
+	if (pkts && (count > 0)) {
 		grspw_list_append_list(&dma->send, pkts);
 		dma->send_cnt += count;
 		if (dma->stats.send_cnt_max < dma->send_cnt)
@@ -1779,7 +1931,7 @@ int grspw_dma_tx_send(void *c, int opts, struct grspw_list *pkts, int count)
 
 out:
 	/* Unlock DMA channel */
-	rtems_semaphore_release(dma->sem_dma);
+	rtems_semaphore_release(dma->sem_txdma);
 
 	return ret;
 }
@@ -1791,7 +1943,7 @@ int grspw_dma_tx_reclaim(void *c, int opts, struct grspw_list *pkts, int *count)
 	int cnt, started;
 
 	/* Take DMA channel lock */
-	if (rtems_semaphore_obtain(dma->sem_dma, RTEMS_WAIT, RTEMS_NO_TIMEOUT)
+	if (rtems_semaphore_obtain(dma->sem_txdma, RTEMS_WAIT, RTEMS_NO_TIMEOUT)
 	    != RTEMS_SUCCESSFUL)
 		return -1;
 
@@ -1832,25 +1984,58 @@ int grspw_dma_tx_reclaim(void *c, int opts, struct grspw_list *pkts, int *count)
 	}
 
 	/* 3. Schedule as many packets as possible (SEND->SCHED) */
-	if ((started > 0 ) && ((opts & 2) == 0))
+	if ((started > 0) && ((opts & 2) == 0))
 		grspw_tx_schedule_send(dma);
 
 	/* Unlock DMA channel */
-	rtems_semaphore_release(dma->sem_dma);
+	rtems_semaphore_release(dma->sem_txdma);
 
 	return (~started) & 1; /* signal DMA has been stopped */
 }
 
-void grspw_dma_tx_count(void *c, int *send, int *sched, int *sent)
+void grspw_dma_tx_count(void *c, int *send, int *sched, int *sent, int *hw)
 {
 	struct grspw_dma_priv *dma = c;
+	int sched_cnt, diff;
+	unsigned int hwbd;
+	struct grspw_txbd *tailbd;
+
+	/* Take device lock - Wait until we get semaphore.
+	 * The lock is taken so that the counters are in sync with each other
+	 * and that DMA descriptor table and tx_ring_tail is not being updated
+	 * during HW counter processing in this function.
+	 */
+	if (rtems_semaphore_obtain(dma->sem_txdma, RTEMS_WAIT, RTEMS_NO_TIMEOUT)
+	    != RTEMS_SUCCESSFUL)
+		return;
 
 	if (send)
 		*send = dma->send_cnt;
+	sched_cnt = dma->tx_sched_cnt;
 	if (sched)
-		*sched = dma->tx_sched_cnt;
+		*sched = sched_cnt;
 	if (sent)
 		*sent = dma->sent_cnt;
+	if (hw) {
+		/* Calculate number of descriptors (processed by HW) between
+		 * HW pointer and oldest SW pointer.
+		 */
+		hwbd = REG_READ(&dma->regs->txdesc);
+		tailbd = dma->tx_ring_tail->bd;
+		diff = ((hwbd - (unsigned int)tailbd) / GRSPW_TXBD_SIZE) &
+			(GRSPW_TXBD_NR - 1);
+		/* Handle special case when HW and SW pointers are equal
+		 * because all TX descriptors have been processed by HW.
+		 */
+		if ((diff == 0) && (sched_cnt == GRSPW_TXBD_NR) &&
+		    ((BD_READ(&tailbd->ctrl) & GRSPW_TXBD_EN) == 0)) {
+			diff = GRSPW_TXBD_NR;
+		}
+		*hw = diff;
+	}
+
+	/* Unlock DMA channel */
+	rtems_semaphore_release(dma->sem_txdma);
 }
 
 static inline int grspw_tx_wait_eval(struct grspw_dma_priv *dma)
@@ -1883,7 +2068,7 @@ static inline int grspw_tx_wait_eval(struct grspw_dma_priv *dma)
 int grspw_dma_tx_wait(void *c, int send_cnt, int op, int sent_cnt, int timeout)
 {
 	struct grspw_dma_priv *dma = c;
-	int ret, rc;
+	int ret, rc, initialized = 0;
 
 	if (timeout == 0)
 		timeout = RTEMS_NO_TIMEOUT;
@@ -1891,22 +2076,22 @@ int grspw_dma_tx_wait(void *c, int send_cnt, int op, int sent_cnt, int timeout)
 check_condition:
 
 	/* Take DMA channel lock */
-	if (rtems_semaphore_obtain(dma->sem_dma, RTEMS_WAIT, RTEMS_NO_TIMEOUT)
+	if (rtems_semaphore_obtain(dma->sem_txdma, RTEMS_WAIT, RTEMS_NO_TIMEOUT)
 	    != RTEMS_SUCCESSFUL)
 		return -1;
 
 	/* Check so that no other thread is waiting, this driver only supports
 	 * one waiter at a time.
 	 */
-	if (dma->tx_wait.waiting) {
-		ret = -1;
-		goto out;
+	if (initialized == 0 && dma->tx_wait.waiting) {
+		ret = 3;
+		goto out_release;
 	}
 
-	/* Stop if link error or similar, abort */
+	/* Stop if link error or similar (DMA stopped), abort */
 	if (dma->started == 0) {
 		ret = 1;
-		goto out;
+		goto out_release;
 	}
 
 	/* Set up Condition */
@@ -1916,10 +2101,11 @@ check_condition:
 
 	if (grspw_tx_wait_eval(dma) == 0) {
 		/* Prepare Wait */
+		initialized = 1;
 		dma->tx_wait.waiting = 1;
 
 		/* Release DMA channel lock */
-		rtems_semaphore_release(dma->sem_dma);
+		rtems_semaphore_release(dma->sem_txdma);
 
 		/* Try to take Wait lock, if this fail link may have gone down
 		 * or user stopped this DMA channel
@@ -1927,27 +2113,34 @@ check_condition:
 		rc = rtems_semaphore_obtain(dma->tx_wait.sem_wait, RTEMS_WAIT,
 						timeout);
 		if (rc == RTEMS_TIMEOUT) {
-			dma->tx_wait.waiting = 0;
-			return 2;
+			ret = 2;
+			goto out;
 		} else if (rc == RTEMS_UNSATISFIED ||
 		           rc == RTEMS_OBJECT_WAS_DELETED) {
-			dma->tx_wait.waiting = 0;
-			return 1; /* sem was flushed/deleted, means DMA stop */
-		} else if (rc != RTEMS_SUCCESSFUL)
-		    	return -1;
+			ret = 1; /* sem was flushed/deleted, means DMA stop */
+			goto out;
+		} else if (rc != RTEMS_SUCCESSFUL) {
+			/* Unknown Error */
+			ret = -1;
+			goto out;
+		} else if (dma->started == 0) {
+			ret = 1;
+			goto out;
+		}
 
 		/* Check condition once more */
 		goto check_condition;
-	} else {
-		/* No Wait needed */
-		dma->tx_wait.waiting = 0;
 	}
 
 	ret = 0;
-out:
-	/* Unlock DMA channel */
-	rtems_semaphore_release(dma->sem_dma);
 
+out_release:
+	/* Unlock DMA channel */
+	rtems_semaphore_release(dma->sem_txdma);
+
+out:
+	if (initialized)
+		dma->tx_wait.waiting = 0;
 	return ret;
 }
 
@@ -1958,7 +2151,7 @@ int grspw_dma_rx_recv(void *c, int opts, struct grspw_list *pkts, int *count)
 	int cnt, started;
 
 	/* Take DMA channel lock */
-	if (rtems_semaphore_obtain(dma->sem_dma, RTEMS_WAIT, RTEMS_NO_TIMEOUT)
+	if (rtems_semaphore_obtain(dma->sem_rxdma, RTEMS_WAIT, RTEMS_NO_TIMEOUT)
 	    != RTEMS_SUCCESSFUL)
 		return -1;
 
@@ -2003,7 +2196,7 @@ int grspw_dma_rx_recv(void *c, int opts, struct grspw_list *pkts, int *count)
 		grspw_rx_schedule_ready(dma);
 
 	/* Unlock DMA channel */
-	rtems_semaphore_release(dma->sem_dma);
+	rtems_semaphore_release(dma->sem_rxdma);
 
 	return (~started) & 1;
 }
@@ -2014,7 +2207,7 @@ int grspw_dma_rx_prepare(void *c, int opts, struct grspw_list *pkts, int count)
 	int ret;
 
 	/* Take DMA channel lock */
-	if (rtems_semaphore_obtain(dma->sem_dma, RTEMS_WAIT, RTEMS_NO_TIMEOUT)
+	if (rtems_semaphore_obtain(dma->sem_rxdma, RTEMS_WAIT, RTEMS_NO_TIMEOUT)
 	    != RTEMS_SUCCESSFUL)
 		return -1;
 
@@ -2042,21 +2235,54 @@ int grspw_dma_rx_prepare(void *c, int opts, struct grspw_list *pkts, int count)
 	ret = 0;
 out:
 	/* Unlock DMA channel */
-	rtems_semaphore_release(dma->sem_dma);
+	rtems_semaphore_release(dma->sem_rxdma);
 
 	return ret;
 }
 
-void grspw_dma_rx_count(void *c, int *ready, int *sched, int *recv)
+void grspw_dma_rx_count(void *c, int *ready, int *sched, int *recv, int *hw)
 {
 	struct grspw_dma_priv *dma = c;
+	int sched_cnt, diff;
+	unsigned int hwbd;
+	struct grspw_rxbd *tailbd;
+
+	/* Take device lock - Wait until we get semaphore.
+	 * The lock is taken so that the counters are in sync with each other
+	 * and that DMA descriptor table and rx_ring_tail is not being updated
+	 * during HW counter processing in this function.
+	 */
+	if (rtems_semaphore_obtain(dma->sem_rxdma, RTEMS_WAIT, RTEMS_NO_TIMEOUT)
+	    != RTEMS_SUCCESSFUL)
+		return;
 
 	if (ready)
 		*ready = dma->ready_cnt;
+	sched_cnt = dma->rx_sched_cnt;
 	if (sched)
-		*sched = dma->rx_sched_cnt;
+		*sched = sched_cnt;
 	if (recv)
 		*recv = dma->recv_cnt;
+	if (hw) {
+		/* Calculate number of descriptors (processed by HW) between
+		 * HW pointer and oldest SW pointer.
+		 */
+		hwbd = REG_READ(&dma->regs->rxdesc);
+		tailbd = dma->rx_ring_tail->bd;
+		diff = ((hwbd - (unsigned int)tailbd) / GRSPW_RXBD_SIZE) &
+			(GRSPW_RXBD_NR - 1);
+		/* Handle special case when HW and SW pointers are equal
+		 * because all RX descriptors have been processed by HW.
+		 */
+		if ((diff == 0) && (sched_cnt == GRSPW_RXBD_NR) &&
+		    ((BD_READ(&tailbd->ctrl) & GRSPW_RXBD_EN) == 0)) {
+			diff = GRSPW_RXBD_NR;
+		}
+		*hw = diff;
+	}
+
+	/* Unlock DMA channel */
+	rtems_semaphore_release(dma->sem_rxdma);
 }
 
 static inline int grspw_rx_wait_eval(struct grspw_dma_priv *dma)
@@ -2089,7 +2315,7 @@ static inline int grspw_rx_wait_eval(struct grspw_dma_priv *dma)
 int grspw_dma_rx_wait(void *c, int recv_cnt, int op, int ready_cnt, int timeout)
 {
 	struct grspw_dma_priv *dma = c;
-	int ret, rc;
+	int ret, rc, initialized = 0;
 
 	if (timeout == 0)
 		timeout = RTEMS_NO_TIMEOUT;
@@ -2097,22 +2323,22 @@ int grspw_dma_rx_wait(void *c, int recv_cnt, int op, int ready_cnt, int timeout)
 check_condition:
 
 	/* Take DMA channel lock */
-	if (rtems_semaphore_obtain(dma->sem_dma, RTEMS_WAIT, RTEMS_NO_TIMEOUT)
+	if (rtems_semaphore_obtain(dma->sem_rxdma, RTEMS_WAIT, RTEMS_NO_TIMEOUT)
 	    != RTEMS_SUCCESSFUL)
 		return -1;
 
 	/* Check so that no other thread is waiting, this driver only supports
 	 * one waiter at a time.
 	 */
-	if (dma->rx_wait.waiting) {
-		ret = -1;
-		goto out;
+	if (initialized == 0 && dma->rx_wait.waiting) {
+		ret = 3;
+		goto out_release;
 	}
 
-	/* Stop if link error or similar (MDA stopped) */
+	/* Stop if link error or similar (DMA stopped), abort */
 	if (dma->started == 0) {
 		ret = 1;
-		goto out;
+		goto out_release;
 	}
 
 	/* Set up Condition */
@@ -2122,10 +2348,11 @@ check_condition:
 
 	if (grspw_rx_wait_eval(dma) == 0) {
 		/* Prepare Wait */
+		initialized = 1;
 		dma->rx_wait.waiting = 1;
 
 		/* Release channel lock */
-		rtems_semaphore_release(dma->sem_dma);
+		rtems_semaphore_release(dma->sem_rxdma);
 
 		/* Try to take Wait lock, if this fail link may have gone down
 		 * or user stopped this DMA channel
@@ -2133,27 +2360,34 @@ check_condition:
 		rc = rtems_semaphore_obtain(dma->rx_wait.sem_wait, RTEMS_WAIT,
 		                           timeout);
 		if (rc == RTEMS_TIMEOUT) {
-			dma->rx_wait.waiting = 0;
-			return 2;
+		    	ret = 2;
+			goto out;
 		} else if (rc == RTEMS_UNSATISFIED ||
 		           rc == RTEMS_OBJECT_WAS_DELETED) {
-			dma->rx_wait.waiting = 0;
-			return 1; /* sem was flushed/deleted, means DMA stop */
-		} else if (rc != RTEMS_SUCCESSFUL)
-		    	return -1;
+			ret = 1; /* sem was flushed/deleted, means DMA stop */
+			goto out;
+		} else if (rc != RTEMS_SUCCESSFUL) {
+		    	/* Unknown Error */
+			ret = -1;
+			goto out;
+		} else if (dma->started == 0) {
+			ret = 1;
+			goto out;
+		}
 
 		/* Check condition once more */
 		goto check_condition;
-	} else {
-		/* No Wait needed */
-		dma->rx_wait.waiting = 0;
 	}
+
 	ret = 0;
 
-out:
+out_release:
 	/* Unlock DMA channel */
-	rtems_semaphore_release(dma->sem_dma);
+	rtems_semaphore_release(dma->sem_rxdma);
 
+out:
+	if (initialized)
+		dma->rx_wait.waiting = 0;
 	return ret;
 }
 
@@ -2164,7 +2398,7 @@ int grspw_dma_config(void *c, struct grspw_dma_config *cfg)
 	if (dma->started || !cfg)
 		return -1;
 
-	if (cfg->flags & ~DMAFLAG_MASK)
+	if (cfg->flags & ~(DMAFLAG_MASK | DMAFLAG2_MASK))
 		return -1;
 
 	/* Update Configuration */
@@ -2209,6 +2443,7 @@ int grspw_dma_start(void *c)
 	struct grspw_dma_priv *dma = c;
 	struct grspw_dma_regs *dregs = dma->regs;
 	unsigned int ctrl;
+	SPIN_IRQFLAGS(irqflags);
 
 	if (dma->started)
 		return 0;
@@ -2258,13 +2493,16 @@ int grspw_dma_start(void *c)
 	ctrl =  GRSPW_DMACTRL_AI | GRSPW_DMACTRL_PS | GRSPW_DMACTRL_PR |
 		GRSPW_DMACTRL_TA | GRSPW_DMACTRL_RA | GRSPW_DMACTRL_RE |
 		(dma->cfg.flags & DMAFLAG_MASK) << GRSPW_DMACTRL_NS_BIT;
-	if (dma->core->dis_link_on_err)
+	if (dma->core->dis_link_on_err & LINKOPTS_DIS_ONERR)
 		ctrl |= GRSPW_DMACTRL_LE;
-	if (dma->cfg.rx_irq_en_cnt != 0)
+	if (dma->cfg.rx_irq_en_cnt != 0 || dma->cfg.flags & DMAFLAG2_RXIE)
 		ctrl |= GRSPW_DMACTRL_RI;
-	if (dma->cfg.tx_irq_en_cnt != 0)
+	if (dma->cfg.tx_irq_en_cnt != 0 || dma->cfg.flags & DMAFLAG2_TXIE)
 		ctrl |= GRSPW_DMACTRL_TI;
+	SPIN_LOCK_IRQ(&dma->core->devlock, irqflags);
+	ctrl |= REG_READ(&dma->regs->ctrl) & GRSPW_DMACTRL_EN;
 	REG_WRITE(&dregs->ctrl, ctrl);
+	SPIN_UNLOCK_IRQ(&dma->core->devlock, irqflags);
 
 	dma->started = 1; /* open up other DMA interfaces */
 
@@ -2273,15 +2511,15 @@ int grspw_dma_start(void *c)
 
 STATIC void grspw_dma_stop_locked(struct grspw_dma_priv *dma)
 {
-	IRQFLAGS_TYPE irqflags;
+	SPIN_IRQFLAGS(irqflags);
 
 	if (dma->started == 0)
 		return;
 	dma->started = 0;
 
-	SPIN_LOCK_IRQ(&priv->devlock, irqflags);
+	SPIN_LOCK_IRQ(&dma->core->devlock, irqflags);
 	grspw_hw_dma_stop(dma);
-	SPIN_UNLOCK_IRQ(&priv->devlock, irqflags);
+	SPIN_UNLOCK_IRQ(&dma->core->devlock, irqflags);
 
 	/* From here no more packets will be sent, however
 	 * there may still exist scheduled packets that has been
@@ -2335,14 +2573,24 @@ void grspw_dma_stop(void *c)
 {
 	struct grspw_dma_priv *dma = c;
 
+	/* If DMA channel is closed we should not access the semaphore */
+	if (!dma->open)
+		return;
+
 	/* Take DMA Channel lock */
-	if (rtems_semaphore_obtain(dma->sem_dma, RTEMS_WAIT, RTEMS_NO_TIMEOUT)
+	if (rtems_semaphore_obtain(dma->sem_rxdma, RTEMS_WAIT, RTEMS_NO_TIMEOUT)
 	    != RTEMS_SUCCESSFUL)
 		return;
+	if (rtems_semaphore_obtain(dma->sem_txdma, RTEMS_WAIT, RTEMS_NO_TIMEOUT)
+	    != RTEMS_SUCCESSFUL) {
+		rtems_semaphore_release(dma->sem_rxdma);
+		return;
+	}
 
 	grspw_dma_stop_locked(dma);
 
-	rtems_semaphore_release(dma->sem_dma);
+	rtems_semaphore_release(dma->sem_txdma);
+	rtems_semaphore_release(dma->sem_rxdma);
 }
 
 /* Do general work, invoked indirectly from ISR */
@@ -2351,8 +2599,8 @@ static void grspw_work_shutdown_func(struct grspw_priv *priv)
 	int i;
 
 	/* Link is down for some reason, and the user has configured
-	 * that we stop all DMA channels and throw out all blocked
-	 * threads.
+	 * that we stop all (open) DMA channels and throw out all their
+	 * blocked threads.
 	 */
 	for (i=0; i<priv->hwsup.ndma_chans; i++)
 		grspw_dma_stop(&priv->dma[i]);
@@ -2360,69 +2608,95 @@ static void grspw_work_shutdown_func(struct grspw_priv *priv)
 }
 
 /* Do DMA work on one channel, invoked indirectly from ISR */
-static void grspw_work_dma_func(struct grspw_dma_priv *dma)
+static void grspw_work_dma_func(struct grspw_dma_priv *dma, unsigned int msg)
 {
-	int tx_cond_true, rx_cond_true;
-	unsigned int ctrl;
-	IRQFLAGS_TYPE irqflags;
+	int tx_cond_true, rx_cond_true, rxtx;
+
+	/* If DMA channel is closed we should not access the semaphore */
+	if (dma->open == 0)
+		return;
+
+	dma->stats.irq_cnt++;
+
+	/* Look at cause we were woken up and clear source */
+	rxtx = 0;
+	if (msg & WORK_DMA_RX_MASK)
+		rxtx |= 1;
+	if (msg & WORK_DMA_TX_MASK)
+		rxtx |= 2;
+	switch (grspw_dma_enable_int(dma, rxtx, 0)) {
+	case 1:
+		/* DMA stopped */
+		return;
+	case 2:
+		/* DMA error -> Stop DMA channel (both RX and TX) */
+		if (msg & WORK_DMA_ER_MASK) {
+			/* DMA error and user wants work-task to handle error */
+			grspw_dma_stop(dma);
+			grspw_work_event(WORKTASK_EV_DMA_STOP, msg);
+		}
+		return;
+	default:
+		break;
+	}
+	if (msg == 0)
+		return;
 
 	rx_cond_true = 0;
 	tx_cond_true = 0;
-	dma->stats.irq_cnt++;
 
-	/* Take DMA channel lock */
-	if (rtems_semaphore_obtain(dma->sem_dma, RTEMS_WAIT, RTEMS_NO_TIMEOUT)
-	    != RTEMS_SUCCESSFUL)
-		return;
+	if ((dma->cfg.flags & DMAFLAG2_IRQD_MASK) == DMAFLAG2_IRQD_BOTH) {
+		/* In case both interrupt sources are disabled simultaneously
+		 * by the ISR the re-enabling of the interrupt source must also
+		 * do so to avoid missing interrupts. Both RX and TX process
+		 * will be forced.
+		 */
+		msg |= WORK_DMA_RX_MASK | WORK_DMA_TX_MASK;
+	}
 
-	/* Look at cause we were woken up and clear source */
-	SPIN_LOCK_IRQ(&priv->devlock, irqflags);
-	ctrl = REG_READ(&dma->regs->ctrl);
+	if (msg & WORK_DMA_RX_MASK) {
+		/* Do RX Work */
 
-	/* Read/Write DMA error ? */
-	if (ctrl & GRSPW_DMA_STATUS_ERROR) {
-		/* DMA error -> Stop DMA channel (both RX and TX) */
-		SPIN_UNLOCK_IRQ(&priv->devlock, irqflags);
-		grspw_dma_stop_locked(dma);
-	} else if (ctrl & (GRSPW_DMACTRL_PR | GRSPW_DMACTRL_PS)) {
-		/* DMA has finished a TX/RX packet */
-		ctrl &= ~GRSPW_DMACTRL_AT;
-		if (dma->cfg.rx_irq_en_cnt != 0)
-			ctrl |= GRSPW_DMACTRL_RI;
-		if (dma->cfg.tx_irq_en_cnt != 0)
-			ctrl |= GRSPW_DMACTRL_TI;
-		REG_WRITE(&dma->regs->ctrl, ctrl);
-		SPIN_UNLOCK_IRQ(&priv->devlock, irqflags);
-		if (ctrl & GRSPW_DMACTRL_PR) {
-			/* Do RX Work */
-			dma->stats.rx_work_cnt++;
-			grspw_rx_process_scheduled(dma);
-			dma->stats.rx_work_enabled += grspw_rx_schedule_ready(dma);
-			/* Check to see if condition for waking blocked USER
-		 	 * task is fullfilled.
+		/* Take DMA channel RX lock */
+		if (rtems_semaphore_obtain(dma->sem_rxdma, RTEMS_WAIT, RTEMS_NO_TIMEOUT)
+		    != RTEMS_SUCCESSFUL)
+			return;
+
+		dma->stats.rx_work_cnt++;
+		grspw_rx_process_scheduled(dma);
+		if (dma->started) {
+			dma->stats.rx_work_enabled +=
+				grspw_rx_schedule_ready(dma);
+			/* Check to see if condition for waking blocked
+		 	 * USER task is fullfilled.
 			 */
-			if (dma->rx_wait.waiting) {
+			if (dma->rx_wait.waiting)
 				rx_cond_true = grspw_rx_wait_eval(dma);
-				if (rx_cond_true)
-					dma->rx_wait.waiting = 0;
-			}
 		}
-		if (ctrl & GRSPW_DMACTRL_PS) {
-			/* Do TX Work */
-			dma->stats.tx_work_cnt++;
-			grspw_tx_process_scheduled(dma);
-			dma->stats.tx_work_enabled += grspw_tx_schedule_send(dma);
-			if (dma->tx_wait.waiting) {
-				tx_cond_true = grspw_tx_wait_eval(dma);
-				if (tx_cond_true)
-					dma->tx_wait.waiting = 0;
-			}
-		}
-	} else
-		SPIN_UNLOCK_IRQ(&priv->devlock, irqflags);
+		rtems_semaphore_release(dma->sem_rxdma);
+	}
 
-	/* Release lock */
-	rtems_semaphore_release(dma->sem_dma);
+	if (msg & WORK_DMA_TX_MASK) {
+		/* Do TX Work */
+
+		/* Take DMA channel TX lock */
+		if (rtems_semaphore_obtain(dma->sem_txdma, RTEMS_WAIT, RTEMS_NO_TIMEOUT)
+		    != RTEMS_SUCCESSFUL)
+			return;
+
+		dma->stats.tx_work_cnt++;
+		grspw_tx_process_scheduled(dma);
+		if (dma->started) {
+			dma->stats.tx_work_enabled += 
+				grspw_tx_schedule_send(dma);
+			/* Check to see if condition for waking blocked
+		 	 * USER task is fullfilled.
+			 */
+			if (dma->tx_wait.waiting)
+				tx_cond_true = grspw_tx_wait_eval(dma);
+		}
+		rtems_semaphore_release(dma->sem_txdma);
+	}
 
 	if (rx_cond_true)
 		rtems_semaphore_release(dma->rx_wait.sem_wait);
@@ -2434,49 +2708,56 @@ static void grspw_work_dma_func(struct grspw_dma_priv *dma)
 /* Work task is receiving work for the work message queue posted from
  * the ISR.
  */
-static void grspw_work_func(rtems_task_argument unused)
+void grspw_work_func(rtems_id msgQ)
 {
-	rtems_status_code status;
-	unsigned int message;
+	unsigned int message = 0, msg;
 	size_t size;
 	struct grspw_priv *priv;
 	int i;
 
-	while (grspw_task_stop == 0) {
-		/* Wait for ISR to schedule work */
-		status = rtems_message_queue_receive(
-			grspw_work_queue, &message,
-			&size, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
-		if (status != RTEMS_SUCCESSFUL)
+	/* Wait for ISR to schedule work */
+	while (rtems_message_queue_receive(msgQ, &message, &size,
+	       RTEMS_WAIT, RTEMS_NO_TIMEOUT) == RTEMS_SUCCESSFUL) {
+		if (message & WORK_QUIT_TASK)
 			break;
 
 		/* Handle work */
 		priv = priv_tab[message >> WORK_CORE_BIT];
-		if (message & WORK_SHUTDOWN)
+		if (message & WORK_SHUTDOWN) {
 			grspw_work_shutdown_func(priv);
-		else if (message & WORK_DMA_MASK) {
-			for (i = 0; i < 4; i++) {
-				if (message & WORK_DMA(i))
-					grspw_work_dma_func(&priv->dma[i]);
+				
+			grspw_work_event(WORKTASK_EV_SHUTDOWN, message);
+		} else if (message & WORK_DMA_MASK) {
+			for (i = 0; i < priv->hwsup.ndma_chans; i++) {
+				msg = message &
+				      (WORK_CORE_MASK | WORK_DMA_CHAN_MASK(i));
+				if (msg)
+					grspw_work_dma_func(&priv->dma[i], msg);
 			}
 		}
+		message = 0;
 	}
+
+	if (message & WORK_FREE_MSGQ)
+		rtems_message_queue_delete(msgQ);
+
+	grspw_work_event(WORKTASK_EV_QUIT, message);
 	rtems_task_delete(RTEMS_SELF);
 }
 
 STATIC void grspw_isr(void *data)
 {
 	struct grspw_priv *priv = data;
-	unsigned int dma_stat, stat, stat_clrmsk, ctrl, icctrl, timecode;
+	unsigned int dma_stat, stat, stat_clrmsk, ctrl, icctrl, timecode, irqs;
 	unsigned int rxirq, rxack, intto;
-	int i, handled = 0, message = WORK_NONE, call_user_int_isr;
-#ifdef RTEMS_HAS_SMP
-	IRQFLAGS_TYPE irqflags;
-#endif
+	int i, handled = 0, call_user_int_isr;
+	unsigned int message = WORK_NONE, dma_en;
+	SPIN_ISR_IRQFLAGS(irqflags);
 
 	/* Get Status from Hardware */
 	stat = REG_READ(&priv->regs->status);
-	stat_clrmsk = stat & (GRSPW_STS_TO | GRSPW_STAT_ERROR);
+	stat_clrmsk = stat & (GRSPW_STS_TO | GRSPW_STAT_ERROR) &
+			(GRSPW_STS_TO | priv->stscfg);
 
 	/* Make sure to put the timecode handling first in order to get the
 	 * smallest possible interrupt latency
@@ -2532,6 +2813,9 @@ STATIC void grspw_isr(void *data)
 		if (stat & GRSPW_STS_PE)
 			priv->stats.err_parity++;
 
+		if (stat & GRSPW_STS_DE)
+			priv->stats.err_disconnect++;
+
 		if (stat & GRSPW_STS_ER)
 			priv->stats.err_escape++;
 
@@ -2541,7 +2825,8 @@ STATIC void grspw_isr(void *data)
 		if (stat & GRSPW_STS_WE)
 			priv->stats.err_wsync++;
 
-		if (priv->dis_link_on_err) {
+		if (((priv->dis_link_on_err >> 16) & stat) &&
+		    (REG_READ(&priv->regs->ctrl) & GRSPW_CTRL_IE)) {
 			/* Disable the link, no more transfers are expected
 			 * on any DMA channel.
 			 */
@@ -2573,24 +2858,47 @@ STATIC void grspw_isr(void *data)
 		/* Check for Errors and if Packets been sent or received if
 		 * respective IRQ are enabled
 		 */
-#ifdef HW_WITH_GI
-		if ( dma_stat & (GRSPW_DMA_STATUS_ERROR | GRSPW_DMACTRL_GI) ) {
-#else
-		if ( (((dma_stat << 3) & (GRSPW_DMACTRL_PR | GRSPW_DMACTRL_PS))
-		     | GRSPW_DMA_STATUS_ERROR) & dma_stat ) {
-#endif
-			/* Disable Further IRQs (until enabled again)
-			 * from this DMA channel. Let the status
-			 * bit remain so that they can be handled by
-			 * work function.
-			 */
+		irqs = (((dma_stat << 3) & (GRSPW_DMACTRL_PR | GRSPW_DMACTRL_PS))
+			| GRSPW_DMA_STATUS_ERROR) & dma_stat;
+		if (!irqs)
+			continue;
+
+		handled = 1;
+
+		/* DMA error has priority, if error happens it is assumed that
+		 * the common work-queue stops the DMA operation for that
+		 * channel and makes the DMA tasks exit from their waiting
+		 * functions (both RX and TX tasks).
+		 * 
+		 * Disable Further IRQs (until enabled again)
+		 * from this DMA channel. Let the status
+		 * bit remain so that they can be handled by
+		 * work function.
+		 */
+		if (irqs & GRSPW_DMA_STATUS_ERROR) {
 			REG_WRITE(&priv->regs->dma[i].ctrl, dma_stat & 
-				~(GRSPW_DMACTRL_RI|GRSPW_DMACTRL_TI|
-				GRSPW_DMACTRL_PR|GRSPW_DMACTRL_PS|
-				GRSPW_DMACTRL_RA|GRSPW_DMACTRL_TA|
-				GRSPW_DMACTRL_AT));
-			message |= WORK_DMA(i);
-			handled = 1;
+				~(GRSPW_DMACTRL_RI | GRSPW_DMACTRL_TI |
+				  GRSPW_DMACTRL_PR | GRSPW_DMACTRL_PS |
+				  GRSPW_DMACTRL_RA | GRSPW_DMACTRL_TA |
+				  GRSPW_DMACTRL_AT));
+			message |= WORK_DMA_ER(i);
+		} else {
+			/* determine if RX/TX interrupt source(s) shall remain
+			 * enabled.
+			 */
+			if (priv->dma[i].cfg.flags & DMAFLAG2_IRQD_SRC) {
+				dma_en = ~irqs >> 3;
+			} else {
+				dma_en = priv->dma[i].cfg.flags >>
+				 (DMAFLAG2_IRQD_BIT - GRSPW_DMACTRL_TI_BIT);
+			}
+			dma_en &= (GRSPW_DMACTRL_RI | GRSPW_DMACTRL_TI);
+			REG_WRITE(&priv->regs->dma[i].ctrl, dma_stat &
+				(~(GRSPW_DMACTRL_RI | GRSPW_DMACTRL_TI |
+				   GRSPW_DMACTRL_PR | GRSPW_DMACTRL_PS |
+				   GRSPW_DMACTRL_RA | GRSPW_DMACTRL_TA |
+				   GRSPW_DMACTRL_AT) | dma_en));
+			message |= WORK_DMA(i, irqs >> GRSPW_DMACTRL_PS_BIT);
 		}
 	}
 	SPIN_UNLOCK(&priv->devlock, irqflags);
@@ -2599,12 +2907,19 @@ STATIC void grspw_isr(void *data)
 		priv->stats.irq_cnt++;
 
 	/* Schedule work by sending message to work thread */
-	if ((message != WORK_NONE) && grspw_work_queue) {
+	if (message != WORK_NONE && priv->wc.msgisr) {
+		int status;
 		message |= WORK_CORE(priv->index);
-		stat = rtems_message_queue_send(grspw_work_queue, &message, 4);
-		if (stat != RTEMS_SUCCESSFUL)
+		/* func interface compatible with msgQSend() on purpose, but
+		 * at the same time the user can assign a custom function to
+		 * handle DMA RX/TX operations as indicated by the "message"
+		 * and clear the handled bits before given to msgQSend().
+		 */
+		status = priv->wc.msgisr(priv->wc.msgisr_arg, &message, 4);
+		if (status != RTEMS_SUCCESSFUL) {
 			printk("grspw_isr(%d): message fail %d (0x%x)\n",
-				priv->index, stat, message);
+				priv->index, status, message);
+		}
 	}
 }
 
@@ -2647,7 +2962,7 @@ STATIC void grspw_hw_stop(struct grspw_priv *priv)
 {
 	int i;
 	unsigned int ctrl;
-	IRQFLAGS_TYPE irqflags;
+	SPIN_IRQFLAGS(irqflags);
 
 	SPIN_LOCK_IRQ(&priv->devlock, irqflags);
 
@@ -2708,6 +3023,20 @@ void grspw_initialize_user(void *(*devfound)(int), void (*devremove)(int,void*))
 	}
 }
 
+/* Get a value at least 6.4us in number of clock cycles */
+static unsigned int grspw1_calc_timer64(int freq_khz)
+{
+	unsigned int timer64 = (freq_khz * 64 + 9999) / 10000;
+	return timer64 & 0xfff;
+}
+
+/* Get a value at least 850ns in number of clock cycles - 3 */
+static unsigned int grspw1_calc_discon(int freq_khz)
+{
+	unsigned int discon = ((freq_khz * 85 + 99999) / 100000) - 3;
+	return discon & 0x3ff;
+}
+
 /******************* Driver manager interface ***********************/
 
 /* Driver prototypes */
@@ -2764,7 +3093,7 @@ static int grspw2_init3(struct drvmgr_dev *dev)
 	GRSPW_DBG("GRSPW[%d] on bus %s\n", dev->minor_drv,
 		dev->parent->dev->name);
 
-	if (grspw_count > GRSPW_MAX)
+	if (grspw_count >= GRSPW_MAX)
 		return DRVMGR_ENORES;
 
 	priv = dev->priv;
@@ -2809,9 +3138,18 @@ static int grspw2_init3(struct drvmgr_dev *dev)
 		priv->hwsup.strip_adr = 1; /* All GRSPW2 can strip Address */
 		priv->hwsup.strip_pid = 1; /* All GRSPW2 can strip PID */
 	} else {
+		unsigned int apb_hz, apb_khz;
+
 		/* Autodetect GRSPW1 features? */
 		priv->hwsup.strip_adr = 0;
 		priv->hwsup.strip_pid = 0;
+
+		drvmgr_freq_get(dev, DEV_APB_SLV, &apb_hz);
+		apb_khz = apb_hz / 1000;
+
+		REG_WRITE(&priv->regs->timer,
+			((grspw1_calc_discon(apb_khz) & 0x3FF) << 12) |
+			(grspw1_calc_timer64(apb_khz) & 0xFFF));
 	}
 
 	/* Probe width of SpaceWire Interrupt ISR timers. All have the same
@@ -2876,6 +3214,83 @@ static int grspw2_init3(struct drvmgr_dev *dev)
 }
 
 /******************* Driver Implementation ***********************/
+/* Creates a MsgQ (optional) and spawns a worker task associated with the
+ * message Q. The task can also be associated with a custom msgQ if *msgQ.
+ * is non-zero.
+ */
+rtems_id grspw_work_spawn(int prio, int stack, rtems_id *pMsgQ, int msgMax)
+{
+	rtems_id tid;
+	int created_msgq = 0;
+	static char work_name = 'A';
+
+	if (pMsgQ == NULL)
+		return OBJECTS_ID_NONE;
+
+	if (*pMsgQ == OBJECTS_ID_NONE) {
+		if (msgMax <= 0)
+			msgMax = 32;
+
+		if (rtems_message_queue_create(
+			rtems_build_name('S', 'G', 'Q', work_name),
+			msgMax, 4, RTEMS_FIFO, pMsgQ) !=
+			RTEMS_SUCCESSFUL)
+			return OBJECTS_ID_NONE;
+		created_msgq = 1;
+	}
+
+	if (prio < 0)
+		prio = grspw_work_task_priority; /* default prio */
+	if (stack < 0x800)
+		stack = RTEMS_MINIMUM_STACK_SIZE; /* default stack size */
+
+	if (rtems_task_create(rtems_build_name('S', 'G', 'T', work_name),
+		prio, stack, RTEMS_PREEMPT | RTEMS_NO_ASR,
+		RTEMS_NO_FLOATING_POINT, &tid) != RTEMS_SUCCESSFUL)
+		tid = OBJECTS_ID_NONE;
+	else if (rtems_task_start(tid, (rtems_task_entry)grspw_work_func, *pMsgQ) !=
+		    RTEMS_SUCCESSFUL) {
+		rtems_task_delete(tid);
+		tid = OBJECTS_ID_NONE;
+	}
+
+	if (tid == OBJECTS_ID_NONE && created_msgq) {
+		rtems_message_queue_delete(*pMsgQ);
+		*pMsgQ = OBJECTS_ID_NONE;
+	} else {
+		if (++work_name > 'Z')
+			work_name = 'A';
+	}
+	return tid;
+}
+
+/* Free task associated with message queue and optionally also the message
+ * queue itself. The message queue is deleted by the work task and is therefore
+ * delayed until it the work task resumes its execution.
+ */
+rtems_status_code grspw_work_free(rtems_id msgQ, int freeMsgQ)
+{
+	int msg = WORK_QUIT_TASK;
+	if (freeMsgQ)
+		msg |= WORK_FREE_MSGQ;
+	return rtems_message_queue_send(msgQ, &msg, 4);
+}
+
+void grspw_work_cfg(void *d, struct grspw_work_config *wc)
+{
+	struct grspw_priv *priv = (struct grspw_priv *)d;
+
+	if (wc == NULL)
+		wc = &grspw_wc_def; /* use default config */
+	priv->wc = *wc;
+}
+
+#ifdef RTEMS_SMP
+int grspw_isr_affinity(void *d, const cpu_set_t *cpus)
+{
+	return -1; /* BSP support only static configured IRQ affinity */
+}
+#endif
 
 static int grspw_common_init(void)
 {
@@ -2896,20 +3311,15 @@ static int grspw_common_init(void)
 	 * user can disable it when interrupt is not used to save resources
 	 */
 	if (grspw_work_task_priority != -1) {
-		if (rtems_message_queue_create(
-		    rtems_build_name('S', 'G', 'L', 'Q'), 32, 4, RTEMS_FIFO,
-		    &grspw_work_queue) != RTEMS_SUCCESSFUL)
-			return -1;
-
-		if (rtems_task_create(rtems_build_name('S', 'G', 'L', 'T'),
-		    grspw_work_task_priority, RTEMS_MINIMUM_STACK_SIZE,
-		    RTEMS_PREEMPT | RTEMS_NO_ASR, RTEMS_NO_FLOATING_POINT,
-		    &grspw_work_task) != RTEMS_SUCCESSFUL)
-			return -1;
-
-		if (rtems_task_start(grspw_work_task, grspw_work_func, 0) !=
-		    RTEMS_SUCCESSFUL)
-			return -1;
+		grspw_work_task = grspw_work_spawn(-1, 0,
+			(rtems_id *)&grspw_wc_def.msgisr_arg, 0);
+		if (grspw_work_task == OBJECTS_ID_NONE)
+			return -2;
+		grspw_wc_def.msgisr =
+			(grspw_msgqisr_t) rtems_message_queue_send;
+	} else {
+		grspw_wc_def.msgisr = NULL;
+		grspw_wc_def.msgisr_arg = NULL;
 	}
 
 	grspw_initialized = 1;

@@ -59,16 +59,16 @@ extern int grspw_work_task_priority;
 #define TXPKT_FLAG_NOCRC_LENe 0x0000000e
 #define TXPKT_FLAG_NOCRC_LENf 0x0000000f
 
-/* Marks if packet was transmitted or not */
-#define TXPKT_FLAG_TX 0x8000
-
 #define TXPKT_FLAG_INPUT_MASK (TXPKT_FLAG_NOCRC_MASK | TXPKT_FLAG_IE | \
 				TXPKT_FLAG_HCRC | TXPKT_FLAG_DCRC)
 
-/* Link Error */
-#define TXPKT_FLAG_LINKERR 0x4000
+/* Marks if packet was transmitted or not */
+#define TXPKT_FLAG_TX 0x4000
 
-#define TXPKT_FLAG_OUTPUT_MASK (TXPKT_FLAG_LINKERR)
+/* Link Error */
+#define TXPKT_FLAG_LINKERR 0x8000
+
+#define TXPKT_FLAG_OUTPUT_MASK (TXPKT_FLAG_TX | TXPKT_FLAG_LINKERR)
 
 /*** RX Packet Flags ***/
 
@@ -118,14 +118,14 @@ extern int grspw_work_task_priority;
  *   type (RX/TX). See XXPKT_FLAG_* options above.
  */
 struct grspw_pkt {
-	struct grspw_pkt *next;
-	unsigned int pkt_id;	/* User assigned ID */
-	unsigned short flags;	/* RX/TX Options */
+	struct grspw_pkt *next;	/* Next packet in list. NULL if last packet */
+	unsigned int pkt_id;	/* User assigned ID (not touched by driver) */
+	unsigned short flags;	/* RX/TX Options and status */
 	unsigned char reserved;	/* Reserved, must be zero */
-	unsigned char hlen;	/* Length of Header Buffer */
+	unsigned char hlen;	/* Length of Header Buffer (only TX) */
 	unsigned int dlen;	/* Length of Data Buffer */
 	void *data;	/* 4-byte or byte aligned depends on HW */
-	void *hdr;	/* 4-byte or byte aligned depends on HW */
+	void *hdr;	/* 4-byte or byte aligned depends on HW (only TX) */
 };
 
 /* GRSPW SpaceWire Packet List */
@@ -184,6 +184,7 @@ struct grspw_core_stats {
 	int err_eeop;
 	int err_addr;
 	int err_parity;
+	int err_disconnect;
 	int err_escape;
 	int err_wsync; /* only in GRSPW1 */
 };
@@ -193,10 +194,37 @@ struct grspw_core_stats {
 #define LINKOPTS_DISABLE	0x0001
 #define LINKOPTS_START		0x0002
 #define LINKOPTS_AUTOSTART	0x0004
-#define LINKOPTS_DIS_ONERR	0x0008
+#define LINKOPTS_DIS_ONERR	0x0008	/* Disable DMA transmitter on link error
+					 * Controls LE bit in DMACTRL register.
+					 */
+#define LINKOPTS_DIS_ON_CE	0x0020000/* Disable Link on Credit error */
+#define LINKOPTS_DIS_ON_ER	0x0040000/* Disable Link on Escape error */
+#define LINKOPTS_DIS_ON_DE	0x0080000/* Disable Link on Disconnect error */
+#define LINKOPTS_DIS_ON_PE	0x0100000/* Disable Link on Parity error */
+#define LINKOPTS_DIS_ON_WE	0x0400000/* Disable Link on write synchonization
+					  * error (GRSPW1 only)
+					  */
+#define LINKOPTS_DIS_ON_EE	0x1000000/* Disable Link on Early EOP/EEP error*/
+
 /*#define LINKOPTS_TICK_OUT_IRQ	0x0100*//* Enable Tick-out IRQ */
-#define LINKOPTS_IRQ		0x0200	/* Enable Error Link IRQ */
-#define LINKOPTS_MASK		0x020f	/* All above options */
+#define LINKOPTS_EIRQ		0x0200	/* Enable Error Link IRQ */
+
+#define LINKOPTS_MASK		0x15e020f/* All above options */
+#define LINKOPTS_MASK_DIS_ON	0x15e0000/* All disable link on error options
+					  * On a certain error the link disable
+					  * bit will be written and the work
+					  * task will call dma_stop() for all
+					  * channels.
+					  */
+
+#define LINKSTS_CE		0x002	/* Credit error */
+#define LINKSTS_ER		0x004	/* Escape error */
+#define LINKSTS_DE		0x008	/* Disconnect error */
+#define LINKSTS_PE		0x010	/* Parity error */
+#define LINKSTS_WE		0x040	/* Write synchonization error (GRSPW1 only) */
+#define LINKSTS_IA		0x080	/* Invalid address */
+#define LINKSTS_EE		0x100	/* Early EOP/EEP */
+#define LINKSTS_MASK		0x1de
 
 /* grspw_tc_ctrl() options */
 #define TCOPTS_EN_RXIRQ	0x0001	/* Tick-Out IRQ */
@@ -233,10 +261,32 @@ struct grspw_core_stats {
 #define DMAFLAG_STRIP_PID	0x0008	/* See HW doc DMA-CTRL SP bit */
 #define DMAFLAG_RESV2		0x0010	/* HAS NO EFFECT */
 #define DMAFLAG_MASK	(DMAFLAG_NO_SPILL|DMAFLAG_STRIP_ADR|DMAFLAG_STRIP_PID)
+/* grspw_dma_config.flags misc options (not shifted internally) */
+#define DMAFLAG2_TXIE	0x00100000	/* See HW doc DMA-CTRL TI bit. 
+					 * Used to enable TX DMA interrupt
+					 * when tx_irq_en_cnt=0.
+					 */
+#define DMAFLAG2_RXIE	0x00200000	/* See HW doc DMA-CTRL RI bit.
+					 * Used to enable RX DMA interrupt
+					 * when rx_irq_en_cnt=0.
+					 */
+/* Defines how the ISR will disable RX/TX DMA interrupt source when a DMA RX/TX
+ * interrupt has happended. DMA Error Interrupt always disables both RX/TX DMA
+ * interrupt. By default both RX/TX IRQs are disabled when either a RX, TX or
+ * both RX/TX DMA interrupt has been requested. The work-task, custom
+ * application handler or custom ISR handler is responsible to re-enable
+ * DMA interrupts.
+ */
+#define DMAFLAG2_IRQD_SRC  0x01000000	/* Disable triggering RX/TX source */
+#define DMAFLAG2_IRQD_NONE 0x00c00000	/* Never disable RX/TX IRQ in ISR */
+#define DMAFLAG2_IRQD_BOTH 0x00000000	/* Always disable both RX/TX sources */
+#define DMAFLAG2_IRQD_MASK 0x01c00000	/* Mask of options */
+#define DMAFLAG2_IRQD_BIT  22
+
+#define DMAFLAG2_MASK	(DMAFLAG2_TXIE | DMAFLAG2_RXIE | DMAFLAG2_IRQD_MASK)
 
 struct grspw_dma_config {
-	int flags;
-
+	int flags;		/* DMA config flags, see DMAFLAG1&2_* options */
 	int rxmaxlen;		/* RX Max Packet Length */
 	int rx_irq_en_cnt;	/* Enable RX IRQ every cnt descriptors */
 	int tx_irq_en_cnt;	/* Enable TX IRQ every cnt descriptors */
@@ -274,6 +324,50 @@ struct grspw_dma_stats {
 	int rx_work_enabled;	/* No. RX BDs enabled by work thread */
 };
 
+/* ISR message sending call back. Compatible with rtems_message_queue_send().
+ * The 'buf' parameter has a pointer to a WORK-TASK message defined by the
+ * WORK_* macros below. The message indicates what GRSPW device operations
+ * are pending, thus what caused the interrupt.
+ *
+ * \param data   defined by grspw_work_config.msgisr_arg, default a rtems_id.
+ * \param buf    Pointer to a 32-bit message word
+ * \param n      Always 4 (byte size of buf).
+ */
+typedef int (*grspw_msgqisr_t)(void *data, unsigned int *buf, unsigned int n);
+
+/* Work message definitions, the int sent to *buf
+ * Bits 31..24: reserved.
+ * Bits 23..16: GRSPW device number message is associated with.
+ * Bit  15:     reserved.
+ * Bit  14:     work-task shall delete message queue on exit.
+ * Bit  13:     work-task shall exit and delete itself.
+ * Bit  12:     link error - shut down all DMA operations (stop DMA channels).
+ * Bit  11..8:  Indicats DMA error on DMA channel 3..0.
+ * Bit  7..0:   Indicats RX and/or TX packets completed on channel 3..0.
+ */
+#define WORK_NONE         0
+#define WORK_SHUTDOWN     0x1000 /* Signal shut down */
+#define WORK_QUIT_TASK    0x2000 /* Work task shall exit (delete itself) */
+#define WORK_FREE_MSGQ    0x4000 /* Delete MsgQ (valid when WORK_QUIT_TASK) */
+#define WORK_DMA(chan, rxtx) (((rxtx) & 0x3) << ((chan) * 2))
+#define WORK_DMA_TX(chan) WORK_DMA(chan, 1)
+#define WORK_DMA_RX(chan) WORK_DMA(chan, 2)
+#define WORK_DMA_ER(chan) (0x1 << ((chan) + 8))
+#define WORK_DMA_MASK     0xfff /* max 4 channels all work */
+#define WORK_DMA_TX_MASK  0x055 /* max 4 channels TX work */
+#define WORK_DMA_RX_MASK  0x0aa /* max 4 channels RX work */
+#define WORK_DMA_ER_MASK  0xf00 /* max 4 channels Error work */
+#define WORK_DMA_CHAN_MASK(chan) (WORK_DMA_ER(chan) | WORK_DMA(chan, 0x3))
+#define WORK_CORE_BIT     16
+#define WORK_CORE_MASK    0x00ff0000
+#define WORK_CORE(device) ((device) << WORK_CORE_BIT)
+
+/* Message Q used to send messages to work task */
+struct grspw_work_config {
+	grspw_msgqisr_t msgisr;
+	void *msgisr_arg; /* example: rtems_id to Msg Q */
+};
+
 extern void grspw_initialize_user(
 	/* Callback every time a GRSPW device is found. Args: DeviceIndex */
 	void *(*devfound)(int),
@@ -283,9 +377,70 @@ extern void grspw_initialize_user(
 	 */
 	void (*devremove)(int,void*)
 	);
+
+/* Creates a MsgQ (optional) and spawns a worker task associated with the
+ * message Q. The task can also be associated with a custom msgQ if *msgQ.
+ * is non-zero.
+ *
+ * \param prio     Task priority, set to -1 for default.
+ * \param stack    Task stack size, set to 0 for default.
+ * \param msgQ     pMsgQ=NULL: illegal,
+ *                 pMsqQ==0: create new MsgQ with task and place in *pMsgQ,
+ *                 *pmsqQ!=0: pointer to MsgQ used for task.
+ * \param msgMax   Maximum number of messages, set to 0 for default.
+ * \return         0 on failure, task id on success.
+ */
+extern rtems_id grspw_work_spawn(int prio, int stack, rtems_id *pMsgQ, int msgMax);
+
+/* Free task associated with message queue and optionally also the message
+ * queue itself. The message queue is deleted by the work task and is therefore
+ * delayed until it the work task resumes its execution.
+ */
+extern rtems_status_code grspw_work_free(rtems_id msgQ, int freeMsgQ);
+
+/* Configure a GRSPW device Work task and Message Q set up.
+ * This affects messages to:
+ *  - DMA AHB error interrupt handling (mandatory)
+ *  - Link status interrupt handling (optional)
+ *  - RX DMA, defaults to common msgQ (configured per DMA channel) 
+ */
+extern void grspw_work_cfg(void *d, struct grspw_work_config *wc);
+
+/* Work-task function, called only from the work task. The function is provided
+ * as a way for the user to create its own work tasks.
+ * The argument determines which message queue the task shall read its
+ * work jobs from.
+ *
+ * The messages are always 32-bit words and follows the format defined by the
+ * WORK_* macros above.
+ */
+extern void grspw_work_func(rtems_id msgQ);
+
+enum grspw_worktask_ev {
+	WORKTASK_EV_NONE = 0,
+	WORKTASK_EV_QUIT = 1,
+	WORKTASK_EV_SHUTDOWN = 2,
+	WORKTASK_EV_DMA_STOP = 3,
+};
+
+/* Weak function to let user override. Function called every time one of the
+ * events above is handled by the work-task. The message 'msg' is the current
+ * message being processed by the work-task.
+ * The user can for example add custom code to invoke on a DMA error, link
+ * error or monitor when the work-task exits after a call to grspw_work_free().
+ */
+extern void grspw_work_event(enum grspw_worktask_ev ev, unsigned int msg);
+
+#ifdef RTEMS_SMP
+/* Set ISR interrupt affinity. The LEON IRQCtrl requires that the cpumask shall
+ * always have one bit set.
+ */
+extern int grspw_isr_affinity(void *d, const cpu_set_t *cpus);
+#endif
+
 extern int grspw_dev_count(void);
 extern void *grspw_open(int dev_no);
-extern void grspw_close(void *d);
+extern int grspw_close(void *d);
 extern void grspw_hw_support(void *d, struct grspw_hw_sup *hw);
 extern void grspw_stats_read(void *d, struct grspw_core_stats *sts);
 extern void grspw_stats_clr(void *d);
@@ -306,9 +461,11 @@ extern spw_link_state_t grspw_link_state(void *d);
  *  bits 7..0  : Clock Div RUN (only run-state)
  *  bits 15..8 : Clock Div During Startup (all link states except run-state)
  */
-extern void grspw_link_ctrl(void *d, int *options, int *clkdiv);
+extern void grspw_link_ctrl(void *d, int *options, int *stscfg, int *clkdiv);
 /* Read the current value of the status register */
 extern unsigned int grspw_link_status(void *d);
+/* Clear bits in the status register */
+extern void grspw_link_status_clr(void *d, unsigned int clearmask);
 
 /*** Time Code Interface ***/
 /* Generate Tick-In (increment Time Counter, Send Time Code) */
@@ -393,10 +550,16 @@ extern int grspw_port_active(void *d);
 
 /*** DMA Interface ***/
 extern void *grspw_dma_open(void *d, int chan_no);
-extern void grspw_dma_close(void *c);
+extern int grspw_dma_close(void *c);
 
 extern int grspw_dma_start(void *c);
 extern void grspw_dma_stop(void *c);
+
+/* Enable interrupt manually */
+extern unsigned int grspw_dma_enable_int(void *c, int rxtx, int force);
+
+/* Return Current DMA Control & Status Register */
+extern unsigned int grspw_dma_ctrlsts(void *c);
 
 /* Schedule List of packets for transmission at some point in
  * future.
@@ -452,11 +615,11 @@ extern int grspw_dma_tx_send(void *c, int opts, struct grspw_list *pkts, int cou
 extern int grspw_dma_tx_reclaim(void *c, int opts, struct grspw_list *pkts, int *count);
 
 /* Get current number of Packets in respective TX Queue. */
-extern void grspw_dma_tx_count(void *c, int *send, int *sched, int *sent);
+extern void grspw_dma_tx_count(void *c, int *send, int *sched, int *sent, int *hw);
 
 #define GRSPW_OP_AND 0
 #define GRSPW_OP_OR 1
-/* Block until ready_cnt or fewer packets are Queued in "Send and Scheduled" Q,
+/* Block until send_cnt or fewer packets are Queued in "Send and Scheduled" Q,
  * op (AND or OR), sent_cnt or more packet "have been sent" (Sent Q) condition
  * is met.
  * If a link error occurs and the Stop on Link error is defined, this function
@@ -473,6 +636,7 @@ extern void grspw_dma_tx_count(void *c, int *send, int *sched, int *sent);
  *  0    Returing to caller because specified conditions are now fullfilled
  *  1    DMA stopped
  *  2    Timeout, conditions are not met
+ *  3    Another task is already waiting. Service is Busy.
  */
 extern int grspw_dma_tx_wait(void *c, int send_cnt, int op, int sent_cnt, int timeout);
 
@@ -523,7 +687,7 @@ extern int grspw_dma_rx_recv(void *c, int opts, struct grspw_list *pkts, int *co
 extern int grspw_dma_rx_prepare(void *c, int opts, struct grspw_list *pkts, int count);
 
 /* Get current number of Packets in respective RX Queue. */
-extern void grspw_dma_rx_count(void *c, int *ready, int *sched, int *recv);
+extern void grspw_dma_rx_count(void *c, int *ready, int *sched, int *recv, int *hw);
 
 /* Block until recv_cnt or more packets are Queued in RECV Q, op (AND or OR), 
  * ready_cnt or fewer packet buffers are available in the "READY and Scheduled" Q,
@@ -534,7 +698,7 @@ extern void grspw_dma_rx_count(void *c, int *ready, int *sched, int *recv);
  * the other conditions. If timeout is zero, the function will wait forever
  * until the condition is satisfied.
  *
- * NOTE: if IRQ of TX descriptors are not enabled conditions are never
+ * NOTE: if IRQ of RX descriptors are not enabled conditions are never
  *       checked, this may hang infinitely unless a timeout has been specified
  *
  * Return Code
@@ -542,6 +706,7 @@ extern void grspw_dma_rx_count(void *c, int *ready, int *sched, int *recv);
  *  0    Returing to caller because specified conditions are now fullfilled
  *  1    DMA stopped
  *  2    Timeout, conditions are not met
+ *  3    Another task is already waiting. Service is Busy.
  */
 extern int grspw_dma_rx_wait(void *c, int recv_cnt, int op, int ready_cnt, int timeout);
 
@@ -607,6 +772,9 @@ grspw_list_prepend(struct grspw_list *list, struct grspw_pkt *pkt)
 static inline void
 grspw_list_append_list(struct grspw_list *list, struct grspw_list *alist)
 {
+	if (grspw_list_is_empty(alist)) {
+		return;
+	}
 	alist->tail->next = NULL;
 	if ( list->tail == NULL ) {
 		list->head = alist->head;
@@ -619,6 +787,9 @@ grspw_list_append_list(struct grspw_list *list, struct grspw_list *alist)
 static inline void
 grspw_list_prepend_list(struct grspw_list *list, struct grspw_list *alist)
 {
+	if (grspw_list_is_empty(alist)) {
+		return;
+	}
 	if ( list->head == NULL ) {
 		list->tail = alist->tail;
 		alist->tail->next = NULL;
@@ -632,6 +803,9 @@ grspw_list_prepend_list(struct grspw_list *list, struct grspw_list *alist)
 static inline void
 grspw_list_remove_head_list(struct grspw_list *list, struct grspw_list *dlist)
 {
+	if (grspw_list_is_empty(dlist)) {
+		return;
+	}
 	list->head = dlist->tail->next;
 	if ( list->head == NULL ) {
 		list->tail = NULL;

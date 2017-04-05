@@ -73,13 +73,14 @@
 	.set   r0,   0
 	.set   r3,   3
 	.set   r4,   4
-	.set   r5,   5
+	/* Do not use r5, since this is used by _CPU_Context_switch() */
 	.set   r6,   6
 	.set   r7,   7
-
+	.set   r8,   8
+	.set   r9,   9
 	.set   r10, 10
 	.set   r11, 11
-	.set   r12, 12
+	/* Do not use r12, since this is used by _CPU_Context_switch() */
 
 	.set   cr5,  5
 
@@ -575,22 +576,22 @@ _CPU_save_altivec_volatile:
 	/* Save CRC -- it is used implicitly by all the LOAD/STORE macros
 	 * when testing if we really should do the load/store operation.
 	 */
-	mfcr      r12
+	mfcr      r9
 #endif
 
-	PREP_FOR_SAVE r0, r3, r4, r5, r6, r10
+	PREP_FOR_SAVE r0, r3, r4, r8, r6, r10
 	/* r0 now contains VRSAVE, r3 still the aligned memory area
-	 * and r4, r5, r6 are offset by 16, 32, and 48 bytes from r3,
+	 * and r4, r8, r6 are offset by 16, 32, and 48 bytes from r3,
 	 * respectively. r10 holds zero
 	 */
-	S_V0TOV19     _B0=r3, _B1=r4, _B2=r5, _B3=r6, _O1=r10, _O2=r11
+	S_V0TOV19     _B0=r3, _B1=r4, _B2=r8, _B3=r6, _O1=r10, _O2=r11
 	mfvscr        v0
 	/* Store vrsave (still in r0) and vscr (in v0) to memory area */
 	S_VSCR_VRSAVE r0, v0, r3, r11
 
 #ifndef IGNORE_VRSAVE
 	/* Restore CRC */
-	mtcr      r12
+	mtcr      r9
 #endif
 	blr
 
@@ -603,7 +604,7 @@ _CPU_load_altivec_volatile:
 	/* Save CRC -- it is used implicitly by all the LOAD/STORE macros
 	 * when testing if we really should do the load/store operation.
 	 */
-	mfcr      r12
+	mfcr      r9
 #endif
 
 	/* Try to preload 1st line (where vscr and vrsave are stored) */
@@ -613,13 +614,13 @@ _CPU_load_altivec_volatile:
 	/* Start preloading 2nd line (where first two vectors are)    */
 	dcbt      0, r3
 	L_VSCR_VRSAVE r3, r0, v0
-	CMP_BASES     r3, r4, r5, r6, r10
+	CMP_BASES     r3, r4, r8, r6, r10
 	/* Start preloading 3rd line (where vectors 3 and 4 are)      */
-	dcbt      0, r5
-	L_V0TOV19 r3, r4, r5, r6, r10, r11
+	dcbt      0, r8
+	L_V0TOV19 r3, r4, r8, r6, r10, r11
 
 #ifndef IGNORE_VRSAVE
-	mtcr      r12
+	mtcr      r9
 #endif
 	blr
 
@@ -627,9 +628,9 @@ _CPU_load_altivec_volatile:
 _CPU_Context_switch_altivec:
 
 	/* fetch offset of altivec area in context                   */
-	CMPOFF    r5
+	CMPOFF    r8
 	/* down-align 'to' area to cache-line boundary               */
-	add       r4, r4, r5
+	add       r4, r4, r8
 	CACHE_DOWNALGN r4
 
 	/* Check for PSIM                                            */
@@ -649,7 +650,7 @@ _CPU_Context_switch_altivec:
 	/* Save CRC -- it is used implicitly by all the LOAD/STORE macros
 	 * when testing if we really should do the load/store operation.
 	 */
-	mfcr      r12
+	mfcr      r9
 #endif
 
 	/* Is 'from' context == NULL ? (then we just do a 'restore') */
@@ -658,21 +659,21 @@ _CPU_Context_switch_altivec:
 
 	/* SAVE NON-VOLATILE REGISTERS                               */
 
-	/* Compute aligned destination pointer (r5 still holds offset
+	/* Compute aligned destination pointer (r8 still holds offset
 	 * to 'altivec' area in context)
 	 */
-	add       r3, r3, r5
+	add       r3, r3, r8
 	CACHE_DOWNALGN r3
 
-	PREP_FOR_SAVE r0, r3, r5, r6, r7, r10
+	PREP_FOR_SAVE r0, r3, r8, r6, r7, r10
 	/* The manual says reading vscr can take some time - do 
 	 * read it here (into a volatile vector register) while
 	 * we wait for cache blocks to be allocated
 	 */
 	mfvscr    v0
-	S_V20TOV31 _LRU=l, _B0=r3, _B1=r5, _B2=r6, _B3=r7, _O1=r10, _O2=r11
+	S_V20TOV31 _LRU=l, _B0=r3, _B1=r8, _B2=r6, _B3=r7, _O1=r10, _O2=r11
 	/* vrsave is now in r0 (PREP_FOR_SAVE), vscr in v0 */
-	S_VSCR_VRSAVE r0, v0, r3, r5
+	S_VSCR_VRSAVE r0, v0, r3, r8
 
 1:
 
@@ -681,22 +682,22 @@ _CPU_Context_switch_altivec:
 	/* Advance past vrsave/vscr area                             */
 	addi      r4, r4, PPC_CACHE_ALIGNMENT
 	L_VSCR_VRSAVE r4, r0, v0
-	CMP_BASES r4, r5, r6, r7, r10
-	L_V20TOV31 r4, r5, r6, r7, r10, r11
+	CMP_BASES r4, r8, r6, r7, r10
+	L_V20TOV31 r4, r8, r6, r7, r10, r11
 
 #ifndef IGNORE_VRSAVE
-	mtcr      r12
+	mtcr      r9
 #endif
 	blr
 
 	.global _CPU_Context_initialize_altivec
 _CPU_Context_initialize_altivec:
-	CMPOFF    r5
-	add       r3, r3, r5
+	CMPOFF    r8
+	add       r3, r3, r8
 	CACHE_DOWNALGN r3
-	lis       r5, _CPU_altivec_vrsave_initval@ha
-	lwz       r5, _CPU_altivec_vrsave_initval@l(r5)
-	stw       r5, VRSAVE_OFF(r3)
+	lis       r8, _CPU_altivec_vrsave_initval@ha
+	lwz       r8, _CPU_altivec_vrsave_initval@l(r8)
+	stw       r8, VRSAVE_OFF(r3)
 	lis       r6, _CPU_altivec_vscr_initval@ha
 	lwz       r6, _CPU_altivec_vscr_initval@l(r6)
 	stw       r6, VSCR_OFF(r3)
@@ -715,8 +716,8 @@ _CPU_Context_initialize_altivec:
 	 */
 	.global _CPU_altivec_set_vrsave_initval
 _CPU_altivec_set_vrsave_initval:
-	lis       r5, _CPU_altivec_vrsave_initval@ha
-	stw       r3, _CPU_altivec_vrsave_initval@l(r5)
+	lis       r8, _CPU_altivec_vrsave_initval@ha
+	stw       r3, _CPU_altivec_vrsave_initval@l(r8)
 	mtvrsave  r3
 	blr
 
@@ -761,7 +762,7 @@ _CPU_altivec_load_all:
 	/* Save CRC -- it is used implicitly by all the LOAD/STORE macros
 	 * when testing if we really should do the load/store operation.
 	 */
-	mfcr      r12
+	mfcr      r9
 #endif
 
 	/* Try to preload 1st line (where vscr and vrsave are stored) */
@@ -771,13 +772,13 @@ _CPU_altivec_load_all:
 	/* Start preloading 2nd line (where first two vectors are)    */
 	dcbt      0, r3
 	L_VSCR_VRSAVE r3, r0, v0
-	CMP_BASES     r3, r4, r5, r6, r10
+	CMP_BASES     r3, r4, r8, r6, r10
 	/* Start preloading 3rd line (where vectors 3 and 4 are)      */
-	dcbt      0, r5
-	L_V0TOV31 r3, r4, r5, r6, r10, r11
+	dcbt      0, r8
+	L_V0TOV31 r3, r4, r8, r6, r10, r11
 
 #ifndef IGNORE_VRSAVE
-	mtcr      r12
+	mtcr      r9
 #endif
 	blr
 
@@ -791,22 +792,22 @@ _CPU_altivec_save_all:
 	/* Save CRC -- it is used implicitly by all the LOAD/STORE macros
 	 * when testing if we really should do the load/store operation.
 	 */
-	mfcr      r12
+	mfcr      r9
 #endif
 
-	PREP_FOR_SAVE r0, r3, r4, r5, r6, r10
+	PREP_FOR_SAVE r0, r3, r4, r8, r6, r10
 	/* r0 now contains VRSAVE, r3 still the aligned memory area
-	 * and r4, r5, r6 are offset by 16, 32, and 48 bytes from r3,
+	 * and r4, r8, r6 are offset by 16, 32, and 48 bytes from r3,
 	 * respectively. r10 holds zero
 	 */
-	S_V0TOV31     _B0=r3, _B1=r4, _B2=r5, _B3=r6, _O1=r10, _O2=r11
+	S_V0TOV31     _B0=r3, _B1=r4, _B2=r8, _B3=r6, _O1=r10, _O2=r11
 	mfvscr        v0
 	/* Store vrsave (still in r0) and vscr (in v0) to memory area */
 	S_VSCR_VRSAVE r0, v0, r3, r11
 
 #ifndef IGNORE_VRSAVE
 	/* Restore CRC */
-	mtcr      r12
+	mtcr      r9
 #endif
 	blr
 

@@ -54,13 +54,20 @@ _start:
 	bl	bsp_fdt_copy
 
 #ifdef QORIQ_HAS_WRITE_BACK_L1_CACHE
-	LWI	r3, bsp_section_start_begin
-	LWI	r4, bsp_section_data_load_end
-	sub	r4, r4, r3
-	bl	rtems_cache_flush_multiple_data_lines
-#else
-	bl	qoriq_l1cache_invalidate
+	/*
+	 * See PowerPC e500 Core Family Reference Manual, 11.5, L1 Data Cache
+	 * Flushing.
+	 */
+	LWI	r3, 12 * 128
+	mtctr	r3
+	LWI	r4, bsp_section_bss_begin
+1:
+	dcbz	r0, r4
+	addi	r4, r4, 32
+	bdnz	1b
 #endif
+
+	bl	qoriq_l1cache_invalidate
 
 #ifdef QORIQ_CLUSTER_1_L2CSR0
 	LWI	r3, QORIQ_CLUSTER_1_L2CSR0
@@ -120,6 +127,7 @@ _start:
 	bdnz	.Lnull_area_setup_loop
 .Lnull_area_setup_done:
 
+	li	r3, 1
 	bl	.Linitmmu
 
 	/* Clear SBSS */
@@ -232,8 +240,8 @@ _start:
 	mflr	SAVED_LINK_REGISTER
 
 	/* Configure MMU */
-	li	r3, FIRST_TLB
-	li	r4, SCRATCH_TLB
+	li	r4, FIRST_TLB
+	li	r5, SCRATCH_TLB
 	bl	qoriq_mmu_config
 	mtmsr	INITIAL_MSR
 	isync
@@ -320,6 +328,7 @@ _start_secondary_processor:
 	mr	START_STACK, r3
 
 	bl	.Linitmore
+	li	r3, 0
 	bl	.Linitmmu
 	b	bsp_start_on_secondary_processor
 #endif /* RTEMS_SMP */

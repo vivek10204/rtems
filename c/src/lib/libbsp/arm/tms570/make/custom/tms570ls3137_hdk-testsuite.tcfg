@@ -4,3 +4,4 @@
 # Format is one line per test that is _NOT_ built.
 #
 
+exclude: linpack

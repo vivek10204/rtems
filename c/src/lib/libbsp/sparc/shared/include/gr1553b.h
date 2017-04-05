@@ -51,8 +51,8 @@ struct gr1553b_regs {
 
 	int unused2[(0x68-0x60)/4];	/* Padding */
 
-	volatile uint32_t bc_slot;	/* 0x48 BC Current BD pointer */
-	volatile uint32_t bc_aslot;	/* 0x4c BC Current async BD pointer */
+	volatile uint32_t bc_slot;	/* 0x68 BC Current BD pointer */
+	volatile uint32_t bc_aslot;	/* 0x6c BC Current async BD pointer */
 
 	int unused3[(0x80-0x70)/4];	/* Padding */
 
@@ -198,17 +198,19 @@ struct gr1553b_regs {
 #define GR1553B_RT_CFG_RTKEY		(0xffff<<GR1553B_RT_CFG_RTKEY_BIT)
 
 /*** RT Bus Status Register ***/
-#define GR1553B_RT_STAT2_RTEN_BIT	0
+#define GR1553B_RT_STAT2_TFLG_BIT	0
 #define GR1553B_RT_STAT2_DBCA_BIT	1
 #define GR1553B_RT_STAT2_SSF_BIT	2
 #define GR1553B_RT_STAT2_BUSY_BIT	3
 #define GR1553B_RT_STAT2_SREQ_BIT	4
+#define GR1553B_RT_STAT2_TFDE_BIT	8
 
-#define GR1553B_RT_STAT2_RTEN		(1<<GR1553B_RT_STAT2_RTEN_BIT)
+#define GR1553B_RT_STAT2_TFLG		(1<<GR1553B_RT_STAT2_TFLG_BIT)
 #define GR1553B_RT_STAT2_DBCA		(1<<GR1553B_RT_STAT2_DBCA_BIT)
 #define GR1553B_RT_STAT2_SSF		(1<<GR1553B_RT_STAT2_SSF_BIT)
 #define GR1553B_RT_STAT2_BUSY		(1<<GR1553B_RT_STAT2_BUSY_BIT)
-#define GR1553B_RT_STAT2_SREQ		(1<<GR1553B_RT_STAT2_RTEN_BIT)
+#define GR1553B_RT_STAT2_SREQ		(1<<GR1553B_RT_STAT2_SREQ_BIT)
+#define GR1553B_RT_STAT2_TFDE		(1<<GR1553B_RT_STAT2_TFDE_BIT)
 
 /*** RT Status Words Register ***/
 #define GR1553B_RT_STATW_VECW_BIT	0

@@ -453,7 +453,11 @@ void ambapp_dev_info(
 }
 #endif
 
-/* Fix device in last stage */
+/* Fix device in last stage and/or register additional devices.
+ * Function returns:
+ *  0  Register device as normal
+ *  1  Fixup function handles registration
+ */
 static int ambapp_dev_fixup(struct drvmgr_dev *dev, struct amba_dev_info *pnp)
 {
 	/* OCCAN speciality:
@@ -464,12 +468,14 @@ static int ambapp_dev_fixup(struct drvmgr_dev *dev, struct amba_dev_info *pnp)
 	 *
 	 *  Now, lets detect sub cores.
 	 */
-	if ( (pnp->info.device == GAISLER_CANAHB) && (pnp->info.vendor == VENDOR_GAISLER) ) {
-		struct drvmgr_dev *newdev;
+	if ( (pnp->info.device == GAISLER_CANAHB) &&
+	     (pnp->info.vendor == VENDOR_GAISLER) ) {
+		struct drvmgr_dev *newdev, *devs_to_register[8];
 		struct amba_dev_info *pnpinfo;
 		int subcores;
 		int core;
 
+		devs_to_register[0] = dev;
 		subcores = (pnp->info.ahb_slv->ver & 0x7) + 1;
 		for(core = 1; core < subcores; core++) {
 			drvmgr_alloc_dev(&newdev, sizeof(*pnpinfo));
@@ -480,10 +486,14 @@ static int ambapp_dev_fixup(struct drvmgr_dev *dev, struct amba_dev_info *pnp)
 			pnpinfo->info.irq += core;
 			newdev->businfo = (void *)pnpinfo;
 
-			/* Register device */
-			drvmgr_dev_register(newdev);
+			devs_to_register[core] = newdev;
 		}
-	} else if ( (pnp->info.device == GAISLER_GPIO) && (pnp->info.vendor == VENDOR_GAISLER) ) {
+		/* Register all CAN devices */
+		for(core = 0; core < subcores; core++)
+			drvmgr_dev_register(devs_to_register[core]);
+		return 1;
+	} else if ( (pnp->info.device == GAISLER_GPIO) &&
+		    (pnp->info.vendor == VENDOR_GAISLER) ) {
 		/* PIO[N] is connected to IRQ[N]. */
 		pnp->info.irq = 0;
 	}
@@ -583,10 +593,29 @@ static void ambapp_core_register(
 	/* Connect device with PnP information */
 	newdev->businfo = (void *)pnpinfo;
 
-	ambapp_dev_fixup(newdev, pnpinfo);
+	if ( ambapp_dev_fixup(newdev, pnpinfo) == 0 )
+		drvmgr_dev_register(newdev); /* Register New Device */
+}
 
-	/* Register New Device */
-	drvmgr_dev_register(newdev);
+/* Fix device registration.
+ * Function returns:
+ *  0  Register device as normal
+ *  1  Fixup function handles registration
+ */
+static int ambapp_dev_register_fixup(struct ambapp_dev *dev, struct ambapp_dev_reg_struct *p)
+{
+	/* GR740 GRPCI2 speciality:
+	 * - In the GR740 the APB_SLV is detected before the AHB_SLV
+	 *   which makes the registration incorrect. We deal with it in 
+	 *   this function. */
+	if (    (dev->dev_type == DEV_APB_SLV) &&
+		    (dev->device == GAISLER_GRPCI2) &&
+		    (dev->vendor == VENDOR_GAISLER) &&
+		    (p->ahb_slv == NULL) ) {
+		DBG("GRPCI2 APB_SLV detected before AHB_SLV. Skipping APB_SLV registration.\n");
+		return 1;
+	}
+	return 0;
 }
 
 /* Register one AMBA device */
@@ -606,6 +635,11 @@ static int ambapp_dev_register(struct ambapp_dev *dev, int index, void *arg)
 	
 	DBG("Found [%d:%x:%x], %s\n", index, dev->vendor, dev->device, type);
 #endif
+
+	/* Fixup for device registration */
+	if (ambapp_dev_register_fixup(dev, p)){
+		return 0;
+	}
 
 	if ( dev->dev_type == DEV_AHB_MST ) {
 		if ( p->ahb_mst ) {
